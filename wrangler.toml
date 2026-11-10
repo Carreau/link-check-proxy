@@ -16,7 +16,7 @@ migrations_dir = "migrations"
 # and paste the printed id here (the id is not a secret).
 [[kv_namespaces]]
 binding = "SNAPSHOT"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "d8dad2e926db43e2b8edc4e341b0feff"
 
 # Secrets (set with `npx wrangler secret put ADMIN_TOKEN`):
 #   ADMIN_TOKEN  bootstrap admin credential for /v1/admin/* endpoints
