@@ -1,6 +1,6 @@
 # link-check-proxy — Design Document
 
-Status: **Draft v0.2** (2026-11-10)
+Status: **v0.3**, initial implementation (2026-11-10)
 
 Audience: a small, community-run service for Jupyter and Scientific Python
 projects (NumPy, SciPy, …). Keep it simple; scale later.
@@ -152,51 +152,39 @@ check history summary (next scheduled check, idle level).
 
 ## 5. Data model
 
-```sql
-CREATE TABLE urls (
-  url                TEXT PRIMARY KEY,   -- normalized, no fragment
-  host               TEXT NOT NULL,
-  status             INTEGER,            -- last HTTP status, NULL if none
-  error              TEXT,               -- error kind, NULL if none
-  final_url          TEXT,               -- after redirects
-  checked_at         INTEGER,            -- epoch seconds
-  next_check_at      INTEGER NOT NULL,   -- scheduler key
-  first_seen_at      INTEGER NOT NULL,
-  last_requested_at  INTEGER NOT NULL,   -- coarse (see §6.5)
-  request_count      INTEGER NOT NULL DEFAULT 0,
-  consecutive_failures INTEGER NOT NULL DEFAULT 0,
-  idle_level         INTEGER NOT NULL DEFAULT 0  -- exponential backoff exponent
-);
-CREATE INDEX urls_next_check ON urls(next_check_at);
-CREATE INDEX urls_host ON urls(host);
+The schema lives in `migrations/0001_init.sql`. It has four tables:
 
-CREATE TABLE hosts (
-  host            TEXT PRIMARY KEY,
-  next_allowed_at INTEGER NOT NULL DEFAULT 0,   -- politeness gate
-  backoff_until   INTEGER NOT NULL DEFAULT 0,   -- from 429 / Retry-After
-  min_interval_s  INTEGER NOT NULL DEFAULT 5    -- per-host override hook
-);
+- `urls`: one row per normalized URL (fragment stripped). It holds the last
+  result (`status`, `error`, `final_url`, `checked_at`, `expires_at`) and the
+  scheduling state (`next_check_at`, `last_requested_at`, `request_count`,
+  `consecutive_failures`, `idle_level`). It is indexed on `next_check_at`,
+  plus a partial index for never-checked rows.
+- `hosts`: `backoff_until` for each host, set from 429 / `Retry-After`. This
+  is also where per-host policy overrides will go later.
+- `api_keys`: keys stored as SHA-256 hashes, each with an `is_admin` flag, a
+  daily new-URL quota, and a `revoked_at` timestamp.
+- `api_key_usage`: number of new URLs added per key per UTC day.
 
-CREATE TABLE api_keys (
-  id          TEXT PRIMARY KEY,
-  key_hash    TEXT NOT NULL UNIQUE,   -- SHA-256 of the key
-  name        TEXT NOT NULL,
-  owner       TEXT,
-  is_admin    INTEGER NOT NULL DEFAULT 0,
-  new_url_quota_per_day INTEGER NOT NULL DEFAULT 5000,
-  created_at  INTEGER NOT NULL,
-  revoked_at  INTEGER
-);
-```
+Tables use `WITHOUT ROWID` where the primary key is the natural lookup key,
+which saves one index write per row.
 
 Keys look like `lcp_<32 random base62 chars>`. Only their hash is stored.
+
+### D1 query budget
+
+The free tier of D1 limits the number of queries per invocation and allows at
+most 100 bound parameters per statement. So every bulk operation (lookup,
+insert, touch, applying results) passes its rows as **one JSON parameter**,
+expanded with `json_each()`. A `/v1/check` call costs about 6 queries, and a
+cron tick about 5.
 
 ## 6. Checking & scheduling
 
 ### 6.1 Fetch policy
 
-- `HEAD` first. If the response is `405`, `403` or `501`, or the request
-  errors, retry once with `GET`. The `GET` response body is cancelled right
+- `HEAD` first. If the response is `403`, `404`, `405` or `501`, or the
+  request errors, retry once with `GET`. (Some servers answer `404` to `HEAD`
+  only.) The `GET` response body is cancelled right
   away, without reading it.
 - Follow redirects manually, at most 10 hops. Record `final_url`. The
   `status` we record is the final hop's status. *Later: keep the first hop's
@@ -204,8 +192,14 @@ Keys look like `lcp_<32 random base62 chars>`. Only their hash is stored.
 - Timeout: 15 s per request.
 - User-Agent:
   `link-check-proxy/<version> (+https://<project-url>; contact)`.
-- Politeness: at most 1 in-flight request per host per tick, and at least
-  `min_interval_s` (default 5 s) between requests to the same host.
+- Politeness: at most one URL per host per tick, so roughly one per minute
+  per host.
+- Each tick has a **fetch budget** of 45 outbound fetches, under the Workers
+  subrequest limit. Every redirect hop and every HEAD→GET retry counts
+  against it. A check that runs out of budget is *deferred*: nothing is
+  recorded and it is picked again next tick. At most 6 fetches run at once.
+- A response with `cf-mitigated: challenge` is recorded with its status and
+  `error: "challenged"`.
 - `429`: honor `Retry-After` (default 1 h if it is missing) by setting
   `hosts.backoff_until`. The URL is rescheduled, and the 429 is **not**
   recorded as the URL's result.
@@ -245,26 +239,37 @@ this. If it is requested again later, it simply comes back as `unknown`.
 ### 6.5 Write budget: coarse request tracking
 
 Updating `last_requested_at` on every request would use up the D1 write
-budget. So the API updates it only when the stored value is older than 1 h,
-in a single batched `UPDATE … WHERE url IN (…)`. `request_count` is
-incremented in that same update, so it counts "requested hours" rather than
-raw hits. That is enough to decide whether a URL is hot.
+budget (about 100k rows/day on the free tier, and index entries count too).
+So the API rewrites it only when the stored value is older than **12 h**
+(`requestTouchInterval`), in one batched statement. `request_count` counts
+these touches, not raw hits.
+
+Because of that coarseness, a URL counts as "hot" if
+`last_requested_at >= checked_at - 12h`. The same touch also resets
+`idle_level` to 0. If the URL had gone idle, its next check is pulled
+forward to the hot-refresh point (or to now, if it has already expired).
+
+Rough sizing for the free tier: each active URL costs about 5 row writes per
+day, so it can handle on the order of 10–15k actively requested URLs.
 
 ### 6.6 New (unknown) URLs: spread over time
 
-New URLs are inserted with `next_check_at = now`. Each tick, the scheduler:
+When one request adds several new URLs for the same host, they are inserted
+with `next_check_at` spaced **60 s apart**. A project adding 3,000 GitHub
+links therefore trickles out instead of clogging the head of the queue.
 
-1. selects due URLs ordered by priority:
-   1. unknown URLs, oldest `first_seen_at` first
-   2. hot URLs about to go stale
-   3. everything else, by `next_check_at`
-2. skips hosts that are backing off or not yet allowed,
-3. takes at most one URL per host and at most N (≈40) in total,
-4. checks them concurrently and writes all results in one batch.
+Each tick (every minute), the scheduler:
 
-A burst of new URLs, such as a new project sending 3,000 links, therefore
-spreads out naturally over minutes or hours: limited globally by the per-tick
-budget, and per host by politeness. No explicit random delay is needed.
+1. reads up to 200 never-checked due URLs and up to 200 due URLs of any
+   kind, both ordered by `next_check_at` (hot URLs come early because they
+   are scheduled at 80% of their TTL),
+2. skips hosts that are backing off,
+3. takes at most one URL per host and at most 20 in total,
+4. checks them, at most 6 at a time and within the fetch budget, and
+   writes all results in one statement.
+
+On a 429, the host's `backoff_until` is set, and **all** of that host's
+pending URLs are pushed past it.
 
 ## 7. Security & abuse
 
@@ -285,10 +290,14 @@ budget, and per host by politeness. No explicit random delay is needed.
 - `wrangler` project, with D1 migrations in `migrations/`.
 - One Worker that has both a `fetch` handler (API) and a `scheduled` handler
   (cron `* * * * *`).
-- An admin key is bootstrapped from a Worker secret.
-- Observability: structured logs, and a `/v1/admin/stats` endpoint.
-- Tests: unit tests for the pure scheduler and classification logic, and
-  integration tests with Miniflare / `wrangler dev`.
+- The admin credential is the `ADMIN_TOKEN` Worker secret. Keys created with
+  `"admin": true` are admins too.
+- URLs that have not been requested for 30 days are dropped once a day, by
+  the tick at 03:00 UTC.
+- Observability: one log line per tick, and a `/v1/admin/stats` endpoint.
+- Tests (`npm test`): unit tests for the pure policy, URL and checker logic,
+  plus end-to-end tests of the API and scheduler. These run against the real
+  migration on `node:sqlite`, through a small D1-compatible shim.
 
 ## 9. Risks
 

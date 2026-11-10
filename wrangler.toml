@@ -1,0 +1,16 @@
+name = "link-check-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "link-check-proxy"
+# Fill in after `npx wrangler d1 create link-check-proxy`.
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+# Secrets (set with `npx wrangler secret put ADMIN_TOKEN`):
+#   ADMIN_TOKEN  bootstrap admin credential for /v1/admin/* endpoints
