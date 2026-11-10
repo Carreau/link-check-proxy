@@ -2,7 +2,7 @@ import { handleRequest } from "./api.js";
 import { DEFAULT_CONFIG } from "./config.js";
 import rawAllowlist from "../config/github-oidc.json";
 import { JwksCache, validateAllowlist, verifyGithubToken, type Allowlist } from "./oidc.js";
-import { runMaintenance, runTick } from "./scheduler.js";
+import { runScheduled } from "./scheduler.js";
 import { SNAPSHOT_KEY, type BlobStore } from "./snapshot.js";
 import { Store, type Db } from "./store.js";
 
@@ -11,6 +11,8 @@ export interface Env {
   /** Public snapshot storage. Optional: without it, no snapshot is built. */
   SNAPSHOT?: KVNamespace;
   ADMIN_TOKEN?: string;
+  /** [version_metadata] binding: lets the cron notice a new deployment. */
+  CF_VERSION_METADATA?: { id: string };
 }
 
 const store = (env: Env) => new Store(env.DB as unknown as Db);
@@ -55,21 +57,23 @@ export default {
     });
   },
 
-  async scheduled(controller, env, ctx): Promise<void> {
-    const when = new Date(controller.scheduledTime);
-    const common = { store: store(env), cfg: DEFAULT_CONFIG, nowMs: controller.scheduledTime };
-    // Minute 0 of each hour is housekeeping instead of checking: stats,
-    // public snapshot, and (at 03:00 UTC) dropping long-unrequested URLs.
-    const job =
-      when.getUTCMinutes() === 0
-        ? runMaintenance({
-            ...common,
-            blobs: blobs(env),
-            dropIdle: when.getUTCHours() === 3,
-          }).then((r) => console.log("maintenance", JSON.stringify({ ...r, stats: undefined })))
-        : runTick({ ...common, fetchFn: (input, init) => fetch(input, init) }).then((r) =>
-            console.log("tick", JSON.stringify(r)),
-          );
-    ctx.waitUntil(job.catch((e) => console.error("scheduled job failed", e)));
+  async scheduled(controller, env): Promise<void> {
+    // Await (not just waitUntil) so the invocation lives as long as the job,
+    // and rethrow so failures show as failed runs in Cloudflare's dashboard.
+    try {
+      const r = await runScheduled({
+        store: store(env),
+        cfg: DEFAULT_CONFIG,
+        nowMs: controller.scheduledTime,
+        fetchFn: (input, init) => fetch(input, init),
+        blobs: blobs(env),
+        versionId: env.CF_VERSION_METADATA?.id,
+      });
+      if (r.kind === "tick") console.log("tick", JSON.stringify(r.report));
+      else console.log("maintenance", r.reason, JSON.stringify({ ...r.report, stats: undefined }));
+    } catch (e) {
+      console.error("scheduled job failed", e);
+      throw e;
+    }
   },
 } satisfies ExportedHandler<Env>;

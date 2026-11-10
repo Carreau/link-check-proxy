@@ -13,6 +13,14 @@ export interface Config {
   maxPerHostPerTick: number;
   /** How many due rows to consider per tick, per query. */
   candidateLimit: number;
+  /** Stop starting fetches this long into a tick (ms); the rest is deferred. */
+  tickDeadlineMs: number;
+  /** Picked URLs are pushed this far ahead before fetching, so a killed tick can't wedge the queue head. */
+  claimSeconds: number;
+  /** Run maintenance (stats + snapshot) on minutes divisible by this, instead of a checking tick. */
+  maintenanceEveryMinutes: number;
+  /** Rows per snapshot page (halved automatically if D1 says the value is too big). */
+  snapshotPageSize: number;
   /** Spacing applied to new URLs of the same host inserted in one request. */
   newUrlHostSpacing: number;
 
@@ -48,14 +56,21 @@ export const DEFAULT_CONFIG: Config = {
   maxUrlsPerRequest: 1000,
   maxUrlLength: 2048,
 
-  checksPerTick: 20,
-  fetchBudgetPerTick: 45,
+  // Sized for the free plan: ~50 subrequests per invocation (D1 calls may
+  // count too) and a ~30 s budget for work after the handler returns.
+  checksPerTick: 10,
+  fetchBudgetPerTick: 30,
   fetchConcurrency: 6,
   maxPerHostPerTick: 1,
   candidateLimit: 200,
+  tickDeadlineMs: 20_000,
+  claimSeconds: 10 * 60,
+  // Every 10 minutes while the service settles in; set back to 60 later.
+  maintenanceEveryMinutes: 10,
+  snapshotPageSize: 2000,
   newUrlHostSpacing: 60,
 
-  fetchTimeoutMs: 15_000,
+  fetchTimeoutMs: 5_000,
   maxRedirects: 10,
   defaultRetryAfter: HOUR,
   maxRetryAfter: DAY,

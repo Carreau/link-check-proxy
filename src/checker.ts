@@ -6,16 +6,28 @@ import { normalizeUrl } from "./url.js";
 
 export type FetchFn = (input: string, init: RequestInit) => Promise<Response>;
 
-/** Shared per-tick cap on outbound fetches (Workers subrequest limit). */
+/**
+ * Shared per-tick limits: a cap on outbound fetches (Workers subrequest
+ * limit) and an optional wall-clock deadline (work after the handler returns
+ * is time-limited). Work that hits either is deferred, not recorded.
+ */
 export class Budget {
-  constructor(private remaining: number) {}
+  constructor(
+    private remaining: number,
+    private deadlineMs = Infinity,
+    private clock: () => number = Date.now,
+  ) {}
   take(): boolean {
-    if (this.remaining <= 0) return false;
+    if (this.remaining <= 0 || this.clock() >= this.deadlineMs) return false;
     this.remaining -= 1;
     return true;
   }
   get left(): number {
     return this.remaining;
+  }
+  /** Milliseconds until the deadline (Infinity if none). */
+  timeLeft(): number {
+    return this.deadlineMs - this.clock();
   }
 }
 
@@ -23,6 +35,11 @@ class BudgetExhausted extends Error {}
 
 /** Statuses for which a HEAD answer is not trusted and we retry with GET. */
 const HEAD_FALLBACK = new Set([403, 404, 405, 501]);
+/**
+ * Errors worth retrying with GET (a server that mishandles HEAD). Timeouts,
+ * DNS and TLS failures would just fail again and double the wall time.
+ */
+const GET_RETRY_ERRORS = new Set<ErrorKind>(["connect", "other"]);
 
 type HopResult =
   | { kind: "response"; status: number; finalUrl: string; retryAfter: number | null; challenged: boolean }
@@ -39,7 +56,7 @@ export async function checkUrl(
     let r = await followChain(url, "HEAD", fetchFn, budget, cfg);
     if (
       (r.kind === "response" && HEAD_FALLBACK.has(r.status)) ||
-      (r.kind === "error" && r.error !== "blocked" && r.error !== "too_many_redirects")
+      (r.kind === "error" && GET_RETRY_ERRORS.has(r.error))
     ) {
       r = await followChain(url, "GET", fetchFn, budget, cfg);
     }
@@ -47,7 +64,8 @@ export async function checkUrl(
       return { kind: "result", status: null, error: r.error, finalUrl: r.finalUrl };
     }
     if (r.status === 429) {
-      return { kind: "rate_limited", retryAfter: r.retryAfter };
+      // Back off whoever answered 429, which may be a redirect target.
+      return { kind: "rate_limited", retryAfter: r.retryAfter, host: new URL(r.finalUrl).hostname };
     }
     return {
       kind: "result",
@@ -70,16 +88,22 @@ export async function checkUrl(
     let current = start;
     for (let hop = 0; hop <= cfg.maxRedirects; hop++) {
       if (!budget.take()) throw new BudgetExhausted();
+      // Never run past the tick deadline: cut the timeout short, and treat a
+      // cut-short timeout as "deferred", not as the site timing out.
+      const cutShort = budget.timeLeft() < cfg.fetchTimeoutMs;
+      const timeoutMs = Math.max(1, Math.min(cfg.fetchTimeoutMs, budget.timeLeft()));
       let res: Response;
       try {
         res = await fetchFn(current, {
           method,
           redirect: "manual",
           headers: { "user-agent": cfg.userAgent, accept: "*/*" },
-          signal: AbortSignal.timeout(cfg.fetchTimeoutMs),
+          signal: AbortSignal.timeout(timeoutMs),
         });
       } catch (e) {
-        return { kind: "error", error: classifyError(e), finalUrl: current };
+        const error = classifyError(e);
+        if (error === "timeout" && cutShort) throw new BudgetExhausted();
+        return { kind: "error", error, finalUrl: current };
       }
       // Never read bodies in v1; free the connection.
       res.body?.cancel().catch(() => {});

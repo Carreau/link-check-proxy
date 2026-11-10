@@ -12,6 +12,10 @@ describe("normalizeUrl", () => {
     });
   });
 
+  it("drops trailing dots from host names", () => {
+    expect(n("https://example.org./a")).toEqual({ ok: true, url: "https://example.org/a", host: "example.org" });
+  });
+
   it("drops default ports", () => {
     expect(n("https://example.org:443/")).toMatchObject({ url: "https://example.org/" });
   });
@@ -32,6 +36,12 @@ describe("normalizeUrl", () => {
     ["http://[fd00::1]/", "private_address"],
     ["http://[::ffff:127.0.0.1]/", "private_address"],
     ["http://intranet/", "private_address"],
+    ["http://[::a00:1]/", "private_address"],
+    ["http://[64:ff9b::a00:1]/", "private_address"],
+    ["http://[2002:a00:1::]/", "private_address"],
+    ["http://[ff02::1]/", "private_address"],
+    ["http://192.0.0.1/", "private_address"],
+    ["http://198.18.0.1/", "private_address"],
   ])("rejects %s", (url, reason) => {
     expect(n(url)).toEqual({ ok: false, reason });
   });

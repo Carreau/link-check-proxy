@@ -199,15 +199,34 @@ export class JwksCache {
 
   lookup: KeyLookup = async (kid) => {
     const now = this.nowMs();
-    if (now - this.fetchedAt > 3600_000) await this.refresh();
+    if (now - this.fetchedAt > 3600_000) {
+      // Counts as this minute's refetch too: no second fetch for a new kid.
+      this.lastMissFetch = now;
+      await this.tryRefresh();
+    }
     let key = this.keys.get(kid);
     if (!key && now - this.lastMissFetch > 60_000) {
       this.lastMissFetch = now;
-      await this.refresh();
+      await this.tryRefresh();
       key = this.keys.get(kid);
     }
     return key ?? null;
   };
+
+  /**
+   * Refresh, but keep serving the cached keys if GitHub is unreachable. With
+   * no keys at all, the error propagates (callers get 401). After a failure,
+   * wait 5 minutes before trying again.
+   */
+  private async tryRefresh(): Promise<void> {
+    try {
+      await this.refresh();
+    } catch (e) {
+      if (this.keys.size === 0) throw e;
+      console.error("JWKS refresh failed; using cached keys", e);
+      this.fetchedAt = this.nowMs() - 3600_000 + 300_000;
+    }
+  }
 
   private async refresh(): Promise<void> {
     const res = await this.fetchFn(this.url);

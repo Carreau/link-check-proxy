@@ -24,6 +24,9 @@ background.
 - **All submitted URLs are public** (published in `/v1/snapshot.json`). Any
   user-facing text about submitting URLs must say so. Never add features
   that assume URLs are private.
+- Free-plan sizing matters: a tick must stay under ~50 subrequests (fetches,
+  and possibly D1 calls) and finish in ~20 s. Ticks claim picked URLs and
+  persist per wave; keep it that way (see PROJECT.md §6.6).
 - Never poll full-table queries. D1 free-tier read and write budgets shape
   the design (see PROJECT.md §5 and §6.5).
 - Target: Cloudflare Workers + D1 + Cron Triggers, TypeScript.

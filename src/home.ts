@@ -57,6 +57,7 @@ export function homePage(origin: string, cfg: Config): string {
     background: var(--accent); color: var(--bg); text-decoration: none; font-weight: 600;
   }
   .note { color: var(--muted); font-size: .95rem; }
+  .links { margin: -1.75rem 0 2.5rem; font-size: .95rem; }
   .callout {
     margin: 1.5rem 0; padding: .9rem 1rem; border-left: 4px solid var(--warn);
     background: var(--code-bg); border-radius: 0 6px 6px 0;
@@ -68,6 +69,7 @@ export function homePage(origin: string, cfg: Config): string {
 <main>
 <h1>link-check-proxy</h1>
 <p class="lede">A shared, polite link-status cache for CI link checkers in the Jupyter and Scientific Python ecosystem.</p>
+<nav class="links"><a href="${o}/v1/snapshot.json">Public snapshot (JSON)</a> · <a href="#access">Get access</a> · <a href="${repo}">Source</a></nav>
 
 <h2>Why</h2>
 <p>Many projects run a link checker (Sphinx <code>linkcheck</code>, lychee, markdown-link-check, …) on every push and pull request. Each run hits every external URL again, and the same few sites get the same requests from dozens of projects. Those sites start rate-limiting or blocking CI, and builds turn red for reasons that have nothing to do with your change.</p>
@@ -146,7 +148,7 @@ export function homePage(origin: string, cfg: Config): string {
 <p class="note">Using an API key instead? Drop the token lines and send <code>Authorization: Bearer $LCP_API_KEY</code> from a secret. Plugins for Sphinx and other link checkers may come later. Until then, each project wires up the call itself.</p>
 
 <h2 id="snapshot">Public snapshot (no key needed)</h2>
-<p>Every hour the service publishes all of its results as one JSON file. Callers without a key, such as CI on pull requests from forks, can download it and look up their URLs locally. Fetching the snapshot never adds URLs and never triggers a check. URLs that aren't in it are simply unknown, so check those yourself.</p>
+<p>Every ${cfg.maintenanceEveryMinutes} minutes, and after each deployment, the service publishes all of its results as one JSON file: <a href="${o}/v1/snapshot.json"><code>/v1/snapshot.json</code></a>. Callers without a key, such as CI on pull requests from forks, can download it and look up their URLs locally. Fetching the snapshot never adds URLs and never triggers a check. URLs that aren't in it are simply unknown, so check those yourself.</p>
 <pre><code>curl -s ${o}/v1/snapshot.json</code></pre>
 <pre><code>{"format": 1, "generated_at": 1762770000,
  "fields": ["status", "error", "checked_at", "expires_at", "consecutive_failures"],

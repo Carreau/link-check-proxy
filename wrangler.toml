@@ -18,5 +18,9 @@ migrations_dir = "migrations"
 binding = "SNAPSHOT"
 id = "d8dad2e926db43e2b8edc4e341b0feff"
 
+# Lets the cron notice a new deployment and rebuild the snapshot right away.
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
 # Secrets (set with `npx wrangler secret put ADMIN_TOKEN`):
 #   ADMIN_TOKEN  bootstrap admin credential for /v1/admin/* endpoints

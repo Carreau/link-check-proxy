@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { handleRequest } from "../src/api.js";
 import type { FetchFn } from "../src/checker.js";
 import { DEFAULT_CONFIG, type Config } from "../src/config.js";
-import { runMaintenance, runTick } from "../src/scheduler.js";
+import { runMaintenance, runScheduled, runTick } from "../src/scheduler.js";
 import { buildSnapshot, type BlobStore } from "../src/snapshot.js";
 import { Store } from "../src/store.js";
 import { normalizeUrl } from "../src/url.js";
@@ -215,7 +215,13 @@ describe("admin overview", () => {
     expect(b.stats).toBeNull();
     expect(b.last_tick).toBeNull();
     expect(b.due_now).toBe(3);
-    expect(b.queue).toMatchObject({ never_checked: 3, never_checked_due: 3, refresh_due: 0, checks_per_tick: 20 });
+    expect(b.queue).toMatchObject({
+      never_checked: 3,
+      never_checked_due: 3,
+      refresh_due: 0,
+      checks_per_tick: cfg.checksPerTick,
+      maintenance_every_minutes: cfg.maintenanceEveryMinutes,
+    });
     expect(b.upcoming.map((u: any) => u.state)).toEqual(["unknown", "unknown", "unknown"]);
 
     await tick(okFetch({ "https://b.org/x": 404 }));
@@ -332,5 +338,146 @@ describe("overview ordering", () => {
     const ov = (await (await call("GET", "/v1/admin/overview", ADMIN)).json()) as any;
     expect(ov.upcoming.map((u: any) => u.url)).toEqual(["https://new.org/", "https://old.org/"]);
     expect(ov.queue).toMatchObject({ never_checked: 1, never_checked_due: 1, refresh_due: 1 });
+  });
+});
+
+describe("scheduler robustness", () => {
+  const T = () => Math.floor(clock / 1000);
+
+  it("one host's backlog can't starve other hosts (second pass)", async () => {
+    cfg.candidateLimit = 50;
+    cfg.newUrlHostSpacing = 0;
+    const key = await newKey(10_000);
+    // 300 due URLs on one host, all older than 20 URLs on other hosts.
+    await check(key, Array.from({ length: 300 }, (_, i) => `https://gh.org/${i}`));
+    clock += 1000;
+    await check(key, Array.from({ length: 20 }, (_, i) => `https://h${i}.org/`));
+    const r = await tick(okFetch());
+    expect(r.picked).toBe(cfg.checksPerTick); // 1 from gh.org + 9 others
+  });
+
+  it("claims picked URLs before fetching, so a killed tick can't wedge them", async () => {
+    const key = await newKey();
+    await check(key, ["https://a.org/"]);
+    let during: number | undefined;
+    await tick(async () => {
+      during = (await store.lookup(["https://a.org/"])).get("https://a.org/")!.next_check_at;
+      return new Response(null, { status: 200 });
+    });
+    expect(during).toBe(T() + cfg.claimSeconds);
+  });
+
+  it("deferred URLs are released (due again next tick)", async () => {
+    const key = await newKey();
+    cfg.fetchBudgetPerTick = 1;
+    await check(key, ["https://a.org/", "https://b.org/"]);
+    const r = await tick(okFetch());
+    expect(r).toMatchObject({ picked: 2, results: 1, deferred: 1 });
+    const rows = await store.lookup(["https://a.org/", "https://b.org/"]);
+    const deferredRow = [...rows.values()].find((x) => x.checked_at === null)!;
+    expect(deferredRow.next_check_at).toBe(T());
+  });
+
+  it("a 429 spreads the host's URLs out instead of releasing them all at once", async () => {
+    const key = await newKey();
+    cfg.newUrlHostSpacing = 60;
+    await check(key, ["https://rl.org/1", "https://rl.org/2", "https://rl.org/3"]);
+    await tick(async () => new Response(null, { status: 429, headers: { "retry-after": "600" } }));
+    const times = [...(await store.lookup(["https://rl.org/1", "https://rl.org/2", "https://rl.org/3"])).values()]
+      .map((r) => r.next_check_at - T())
+      .sort((a, b) => a - b);
+    expect(times).toEqual([600, 660, 720]);
+  });
+
+  it("new URLs for a host in backoff start after the backoff", async () => {
+    const key = await newKey();
+    await check(key, ["https://rl.org/1"]);
+    await tick(async () => new Response(null, { status: 429, headers: { "retry-after": "600" } }));
+    await check(key, ["https://rl.org/new"]);
+    const row = (await store.lookup(["https://rl.org/new"])).get("https://rl.org/new")!;
+    expect(row.next_check_at).toBeGreaterThanOrEqual(T() + 600);
+  });
+
+  it("a 429 after a redirect also backs off the redirect target", async () => {
+    const key = await newKey();
+    await check(key, ["https://a.org/x"]);
+    await tick(async (u) =>
+      u.startsWith("https://a.org")
+        ? new Response(null, { status: 301, headers: { location: "https://b.org/y" } })
+        : new Response(null, { status: 429 }),
+    );
+    expect([...(await store.hostsInBackoff(["a.org", "b.org"], T())).keys()].sort()).toEqual(["a.org", "b.org"]);
+  });
+
+  it("bot challenges use the status TTL, not the outage backoff", async () => {
+    const key = await newKey();
+    await check(key, ["https://cf.org/"]);
+    await tick(async () => new Response(null, { status: 403, headers: { "cf-mitigated": "challenge" } }));
+    const row = (await store.lookup(["https://cf.org/"])).get("https://cf.org/")!;
+    expect(row).toMatchObject({ status: 403, error: "challenged", consecutive_failures: 0 });
+    expect(row.expires_at! - row.checked_at!).toBe(cfg.ttlClientError);
+  });
+
+  it("the daily quota holds under concurrent requests", async () => {
+    const key = await newKey(3);
+    const urls = (p: string) => Array.from({ length: 3 }, (_, i) => `https://${p}${i}.org/`);
+    await Promise.all([check(key, urls("a")), check(key, urls("b"))]);
+    const stats = await store.stats(T());
+    expect(stats.urls).toBe(3);
+  });
+
+  it("snapshot pages shrink when D1 says a value is too big", async () => {
+    const key = await newKey();
+    cfg.newUrlHostSpacing = 0;
+    cfg.maxPerHostPerTick = 100;
+    await check(key, Array.from({ length: 9 }, (_, i) => `https://h${i}.org/`));
+    await tick(okFetch());
+    const sizes: number[] = [];
+    const tiny = Object.create(store) as Store;
+    tiny.snapshotPage = async (after, size) => {
+      sizes.push(size);
+      if (size > 2) throw new Error("D1_ERROR: string or blob too big: SQLITE_TOOBIG");
+      return store.snapshotPage(after, size);
+    };
+    const { info } = await buildSnapshot(tiny, 1, 8);
+    expect(info.urls).toBe(9);
+    expect(sizes.slice(0, 3)).toEqual([8, 4, 2]);
+  });
+});
+
+describe("runScheduled", () => {
+  const at = (h: number, m: number) => Date.UTC(2026, 10, 10, h, m, 0);
+  const blobs = () => {
+    const map = new Map<string, string>();
+    return { map, get: async (k: string) => map.get(k) ?? null, put: async (k: string, v: string) => void map.set(k, v) };
+  };
+  const run = (nowMs: number, versionId?: string, b = blobs()) =>
+    runScheduled({ store, cfg, nowMs, fetchFn: okFetch(), blobs: b, versionId });
+
+  it("does maintenance on minutes divisible by maintenanceEveryMinutes, checks otherwise", async () => {
+    cfg.maintenanceEveryMinutes = 10;
+    expect((await run(at(12, 20))).kind).toBe("maintenance");
+    expect((await run(at(12, 21))).kind).toBe("tick");
+  });
+
+  it("rebuilds the snapshot on the first run of a new deployment, once", async () => {
+    const b = blobs();
+    const first = await run(at(12, 21), "v1", b);
+    expect(first).toMatchObject({ kind: "maintenance", reason: "new deployment" });
+    expect(b.map.has("snapshot.json")).toBe(true);
+    expect((await run(at(12, 22), "v1", b)).kind).toBe("tick");
+    expect(await run(at(12, 23), "v2", b)).toMatchObject({ kind: "maintenance", reason: "new deployment" });
+  });
+
+  it("drops idle URLs only at the 03:00 scheduled maintenance", async () => {
+    const key = await newKey();
+    await check(key, ["https://old.org/"]);
+    clock += 40 * DAY_MS;
+    const r1 = await runScheduled({ store, cfg, nowMs: clock - (clock % 3_600_000) + 10 * 60_000, fetchFn: okFetch(), versionId: "v" });
+    expect(r1.kind === "maintenance" && r1.report.dropped).toBe(0);
+    const three = new Date(clock);
+    three.setUTCHours(3, 0, 0, 0);
+    const r2 = await runScheduled({ store, cfg, nowMs: three.getTime() + DAY_MS, fetchFn: okFetch(), versionId: "v" });
+    expect(r2.kind === "maintenance" && r2.report.dropped).toBe(1);
   });
 });

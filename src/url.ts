@@ -17,6 +17,9 @@ export function normalizeUrl(input: unknown, maxLength: number): NormalizeResult
     return { ok: false, reason: "unsupported_scheme" };
   }
   if (u.username || u.password) return { ok: false, reason: "credentials" };
+  // "example.org." and "example.org" are the same host: one cache row,
+  // one politeness/backoff bucket.
+  if (u.hostname.endsWith(".") && !u.hostname.startsWith("[")) u.hostname = u.hostname.replace(/\.+$/, "");
   const blocked = blockedHostReason(u.hostname);
   if (blocked) return { ok: false, reason: blocked };
   u.hash = "";
@@ -55,6 +58,8 @@ function isPrivateIPv4([a, b]: number[]): boolean {
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
     (a === 192 && b === 168) ||
+    (a === 192 && b === 0) || // 192.0.0.0/24 (and 192.0.2.0/24 doc range)
+    (a === 198 && (b === 18 || b === 19)) || // 198.18.0.0/15 benchmarking
     a >= 224
   );
 }
@@ -64,7 +69,10 @@ function isPrivateIPv6(h: string): boolean {
   if (s === "::" || s === "::1") return true;
   if (/^f[cd]/.test(s)) return true; // fc00::/7 unique local
   if (/^fe[89ab]/.test(s)) return true; // fe80::/10 link-local
-  // IPv4-mapped / compatible: be conservative and block.
-  if (s.startsWith("::ffff:") || /^::\d/.test(s)) return true;
+  if (/^ff/.test(s)) return true; // ff00::/8 multicast
+  if (/^64:ff9b:/.test(s)) return true; // NAT64 (embeds IPv4)
+  if (/^2002:/.test(s)) return true; // 6to4 (embeds IPv4)
+  // IPv4-mapped / -compatible (::ffff:a.b.c.d, ::a00:1, ...): block.
+  if (s.startsWith("::ffff:") || /^::[0-9a-f]/.test(s)) return true;
   return false;
 }

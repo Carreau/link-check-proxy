@@ -1,5 +1,5 @@
 /**
- * Public snapshot of every checked URL, rebuilt hourly and served without a
+ * Public snapshot of every checked URL, rebuilt by maintenance and served without a
  * key at /v1/snapshot.json. Lets callers without credentials (e.g. fork PRs)
  * use cached results without ever adding URLs or causing outbound fetches.
  */
@@ -33,8 +33,19 @@ export async function buildSnapshot(
   const parts: string[] = [];
   let after = "";
   let count = 0;
+  let size = pageSize;
   for (;;) {
-    const page = await store.snapshotPage(after, pageSize);
+    let page: Awaited<ReturnType<Store["snapshotPage"]>>;
+    try {
+      page = await store.snapshotPage(after, size);
+    } catch (e) {
+      // A page of long URLs can exceed D1's ~2 MB value limit: shrink & retry.
+      if (size > 1 && /too big|toobig/i.test(String(e))) {
+        size = Math.floor(size / 2);
+        continue;
+      }
+      throw e;
+    }
     if (page.last === null) break;
     if (page.n > 0) parts.push(page.obj.slice(1, -1)); // strip { }
     count += page.n;

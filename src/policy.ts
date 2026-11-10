@@ -5,6 +5,9 @@ import type { ErrorKind, PublicResult, UrlRow } from "./types.js";
 export type Rand = () => number;
 
 export function isFailure(status: number | null, error: ErrorKind | null): boolean {
+  // A bot challenge is the site's policy, not an outage: retrying quickly
+  // just hits the sites that already block us. Use the status's TTL (403: 6 h).
+  if (error === "challenged") return status === null || status >= 500;
   if (error !== null) return true;
   return status === null || status >= 500;
 }

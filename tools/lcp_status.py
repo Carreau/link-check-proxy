@@ -5,7 +5,7 @@
     watch -n 30 tools/lcp_status.py        # add -c and --color for colors
 
 Uses /v1/admin/overview, which only does cheap indexed reads. Full counts
-are cached by the server and refreshed hourly.
+are cached by the server and refreshed by each maintenance run.
 """
 
 from __future__ import annotations
@@ -92,6 +92,27 @@ def queue_line(data: dict) -> str:
     return line
 
 
+def next_batch(data: dict) -> str:
+    """When the next checking tick runs and how big it can be.
+
+    Cron fires at the top of every minute; minutes divisible by
+    maintenance_every_minutes do maintenance instead of checking.
+    """
+    q = data.get("queue")
+    if not q:
+        return ""
+    now = data["now"]
+    every = max(1, q.get("maintenance_every_minutes") or 60)
+    at = (now // 60 + 1) * 60
+    while (at // 60) % every == 0:
+        at += 60
+    due = data["due_now"]
+    if not due:
+        return f"nothing due; next tick in {at - now}s"
+    size = min(due, q["checks_per_tick"])
+    return f"next batch of ≤{size} in {at - now}s"
+
+
 def fit(url: str, width: int) -> str:
     if width <= 1 or len(url) <= width:
         return url
@@ -131,21 +152,22 @@ def render(data: dict, base_url: str, width: int, st: Style) -> str:
     out.append(
         st.dim(f"public snapshot: {snap['urls']} URLs, {snap['bytes'] / 1e6:.1f} MB, built {rel(snap['generated_at'], now)}")
         if snap
-        else st.dim("public snapshot: not built yet (hourly, needs the SNAPSHOT KV binding)")
+        else st.dim("public snapshot: not built yet (rebuilt by maintenance and after each deploy; needs the SNAPSHOT KV binding)")
     )
 
-    # Columns: 10 + 2 + 12 + 2 + 9 + 2 + url
-    url_w = max(20, width - 37)
+    # Columns: 2 + 12 + 2 + 12 + 2 + 9 + 2 + url
+    url_w = max(20, width - 41)
 
     out.append("")
     # Column headings use the same widths as the rows below them.
-    out.append(st.bold("UPCOMING"))
-    out.append(st.dim(f"  {'next check':<10}  {'last checked':<12}  {'status':<9}  url"))
+    out.append(st.bold("UPCOMING") + st.dim(f"  {next_batch(data)}"))
+    out.append(st.dim(f"  {'next check':<12}  {'last checked':<12}  {'status':<9}  url"))
     for r in data.get("upcoming", []):
         nxt = r["next_check_at"]
-        when = "due " + rel(nxt, now).replace(" ago", "") if nxt <= now else rel(nxt, now)
+        # Overdue rows say "overdue 9m", never "due 9m" (reads like "in 9m").
+        when = "overdue " + rel(nxt, now).replace(" ago", "") if nxt < now - 4 else rel(nxt, now)
         out.append(
-            f"  {when[:10]:<10}  {rel(r['checked_at'], now)[:12]:<12}  "
+            f"  {when[:12]:<12}  {rel(r['checked_at'], now)[:12]:<12}  "
             f"{st.status(r['status'], r['error']) if r['checked_at'] else st.dim('-'.ljust(9))}  "
             f"{fit(r['url'], url_w)}"
         )

@@ -35,7 +35,7 @@ export type CheckOutcome =
       finalUrl: string | null;
     }
   /** Host said 429; back off the whole host, record nothing for the URL. */
-  | { kind: "rate_limited"; retryAfter: number | null }
+  | { kind: "rate_limited"; retryAfter: number | null; host: string }
   /** Fetch budget ran out mid-check; try again next tick. */
   | { kind: "deferred" };
 

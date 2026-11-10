@@ -13,7 +13,7 @@ for consumer instructions, or
 ## API
 
 > **Every URL submitted to the service becomes public.** URLs and their
-> results are stored and published in the hourly snapshot at
+> results are stored and published in the public snapshot at
 > `/v1/snapshot.json`, which anyone can download without a key. Key holders
 > must only submit URLs that are already public. Never submit private or
 > internal URLs, or URLs that carry tokens, signed parameters or personal
@@ -49,9 +49,10 @@ $ curl -s $LCP_URL/v1/snapshot.json
  "urls": {"https://numpy.org/": [200, null, 1762760000, 1762846400, 0], ...}}
 ```
 
-It is rebuilt every hour, at minute 0, and served with an `ETag`, so send
-`If-None-Match` to get a `304` when it hasn't changed. Until the first
-rebuild it returns `503`.
+It is rebuilt by every maintenance run (every 10 minutes for now, see
+`maintenanceEveryMinutes` in `src/config.ts`) and on the first cron run after
+each deployment. It is served with an `ETag`, so send `If-None-Match` to get
+a `304` when it hasn't changed. Until the first rebuild it returns `503`.
 
 ## Deploy
 
@@ -148,11 +149,15 @@ wrangler deploy
 Apply migrations **before** deploying, so new code never runs against an
 old schema.
 
+For example, `0002_meta.sql` adds the table behind the monitoring view, and
+`0003_host_index.sql` the per-host index the scheduler relies on.
+
 **Upgrading to the snapshot version:** do step 3 of the bootstrap once
 (create the KV namespace and put its id in `wrangler.toml`). `wrangler deploy`
-fails while the placeholder id is still there. For example, `0002_meta.sql` adds the table behind the monitoring
-view. If you deploy without it, each tick still saves its results but then
-fails with `no such table: meta`.
+fails while the placeholder id is still there.
+
+Each deployment rebuilds the snapshot on the next cron run (via the
+`version_metadata` binding); you don't need to wait for the schedule.
 
 Other useful commands:
 
@@ -232,13 +237,13 @@ watch -n 30 -c tools/lcp_status.py --color
 ```
 link-check-proxy  https://link-check-proxy.carreau.workers.dev  2026-11-10 10:15:33Z
 URLs 1342  fresh 1080  stale 48  unknown 214  failing 12  4xx 31  (counts 21m ago)
-queue: 230 never checked (180 due now), 34 due for refresh; draining takes ≥11m at ≤20/min
-last tick 34s ago: picked 20, ok 18, rate-limited 1, deferred 1
+queue: 230 never checked (180 due now), 34 due for refresh; draining takes ≥22m at ≤10/min
+last tick 34s ago: picked 10, ok 8, rate-limited 1, deferred 1
 
-UPCOMING
-  next check  last checked  status     url
-  due 5m      never         -          https://github.com/jupyter/notebook/issues/123
-  in 45s      15m ago       503        https://docs.scipy.org/doc/scipy/reference/…
+UPCOMING  next batch of ≤10 in 41s
+  next check    last checked  status     url
+  overdue 5m    never         -          https://github.com/jupyter/notebook/issues/123
+  in 45s        15m ago       503        https://docs.scipy.org/doc/scipy/reference/…
 
 RECENT
   checked     next check    status     url
@@ -247,13 +252,41 @@ RECENT
 ```
 
 It reads `/v1/admin/overview`, which only does reads with a fixed limit, so
-polling it is cheap. The totals line is cached and recomputed by the cron job
-once an hour. Set `LCP_URL` to point it at another instance, use `-n` to
+polling it is cheap. The totals line is cached and recomputed by each
+maintenance run (every 10 minutes for now, and after each deploy). Set `LCP_URL` to point it at another instance, use `-n` to
 choose the number of rows (by default it fills the terminal), and `--json` to
 get the raw data.
 
 Avoid polling `/v1/admin/stats` in a loop: it scans the whole table on every
 call, which uses up D1's free-tier read budget.
+
+## Troubleshooting
+
+**URLs stay overdue, and the overdue time grows.** Ticks are failing, or
+being killed, before they save results. Check the watcher's `last tick …
+ago` line (it turns red after 3 minutes), then look at the cron runs:
+
+```console
+wrangler tail link-check-proxy --format json \
+  | jq -c 'select(.event.cron) | {outcome, cpu: .cpuTime, wall: .wallTime, logs: [.logs[].message], ex: .exceptions}'
+```
+
+An `outcome` of `exceededCpu` or `canceled`, or a `scheduled job failed`
+log line, shows why. Ticks claim their URLs before fetching, so even a killed
+tick no longer blocks the head of the queue: those URLs come back 10 minutes
+later. The knobs (`checksPerTick`, `fetchBudgetPerTick`, `tickDeadlineMs`,
+`fetchTimeoutMs`) are in `src/config.ts`.
+
+**One host's URLs drain slowly.** That's by design: at most one check per
+host per minute. The scheduler skips past such a host to keep other hosts
+moving.
+
+```console
+wrangler d1 execute link-check-proxy --remote --command \
+  "SELECT host, COUNT(*) n FROM urls WHERE next_check_at <= strftime('%s','now') GROUP BY host ORDER BY n DESC LIMIT 10"
+wrangler d1 execute link-check-proxy --remote --command \
+  "SELECT host, backoff_until - strftime('%s','now') AS seconds_left FROM hosts WHERE backoff_until > strftime('%s','now')"
+```
 
 ## Development
 

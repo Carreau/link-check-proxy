@@ -1,6 +1,6 @@
 # link-check-proxy — Design Document
 
-Status: **v0.6**, public snapshot + GitHub OIDC (2026-11-10)
+Status: **v0.7**, scheduler hardening after first production load (2026-11-10)
 
 Audience: a small, community-run service for Jupyter and Scientific Python
 projects (NumPy, SciPy, …). Keep it simple; scale later.
@@ -44,7 +44,8 @@ actually being asked about.
                         (global budget + per-host limits)   (outbound fetch)
 ```
 
-An hourly **maintenance** run (minute 0, in place of a checking tick)
+A **maintenance** run (every `maintenanceEveryMinutes`, currently 10, and on
+the first cron run after each deployment, in place of a checking tick)
 recomputes stats and writes the **public snapshot** to Workers KV. It is
 served at `/v1/snapshot.json`.
 
@@ -129,7 +130,7 @@ out who is checking their URLs.
 ### `GET /v1/snapshot.json` (public)
 
 The second endpoint that needs no key. It returns every **checked** URL with
-its last result, as one JSON document rebuilt hourly:
+its last result, as one JSON document rebuilt by every maintenance run:
 
 ```json
 {"format": 1, "generated_at": 1762770000,
@@ -216,7 +217,7 @@ check history summary (next scheduled check, idle level).
   plaintext key is shown only this once.
 - `GET /v1/admin/keys`, `DELETE /v1/admin/keys/:id` (revoke)
 - `GET /v1/admin/overview?limit=N`: cheap, safe to poll. It returns:
-  - the cached full counts (recomputed hourly by the cron job),
+  - the cached full counts (recomputed by every maintenance run),
   - the last tick's report,
   - queue sizes, each counted through an index and capped at 1000: URLs due
     now, never-checked URLs (total, and how many are due), and
@@ -263,31 +264,54 @@ insert, touch, applying results) passes its rows as **one JSON parameter**,
 expanded with `json_each()`. A `/v1/check` call costs about 6 queries, and a
 cron tick about 5.
 
+`urls_host_next (host, next_check_at)` (migration 0003) serves per-host
+access: a 429's backoff update, spreading that host's URLs, and the
+scheduler's second pass. It costs one extra index write per `next_check_at`
+change.
+
+Quota accounting is atomic: the daily counter is incremented first (D1
+serializes writes), and any excess is refunded. Rows another request
+inserted first are refunded too.
+
+Snapshot pages start at 2000 rows. If D1 rejects a page as too big (long
+URLs), the page size is halved and the page retried.
+
+
 ## 6. Checking & scheduling
 
 ### 6.1 Fetch policy
 
 - `HEAD` first. If the response is `403`, `404`, `405` or `501`, or the
-  request errors, retry once with `GET`. (Some servers answer `404` to `HEAD`
-  only.) The `GET` response body is cancelled right
-  away, without reading it.
+  request fails with a `connect` or `other` error, retry once with `GET`.
+  (Some servers answer `404` to `HEAD` only.) Timeouts, DNS and TLS errors are
+  **not** retried: they would fail again and double the wall time. The `GET`
+  response body is cancelled right away, without reading it.
 - Follow redirects manually, at most 10 hops. Record `final_url`. The
   `status` we record is the final hop's status. *Later: keep the first hop's
   status too, to detect permanent redirects.*
-- Timeout: 15 s per request.
+- Timeout: 5 s per request.
 - User-Agent:
   `link-check-proxy/<version> (+https://<project-url>; contact)`.
 - Politeness: at most one URL per host per tick, so roughly one per minute
   per host.
-- Each tick has a **fetch budget** of 45 outbound fetches, under the Workers
-  subrequest limit. Every redirect hop and every HEAD→GET retry counts
-  against it. A check that runs out of budget is *deferred*: nothing is
-  recorded and it is picked again next tick. At most 6 fetches run at once.
+- Each tick has a **fetch budget** of 30 outbound fetches and a **deadline**
+  of 20 s, sized for the free plan. The budget leaves room under the ~50
+  subrequests per invocation, in case D1 calls count too. The deadline keeps
+  the tick inside the time Workers allow. Every redirect hop and every
+  HEAD→GET retry counts against the budget, and no fetch's timeout runs past
+  the deadline. A check that runs out of either is *deferred*: nothing is
+  recorded, and it is due again next tick. A timeout cut short by the
+  deadline counts as deferred, not as the site timing out.
 - A response with `cf-mitigated: challenge` is recorded with its status and
-  `error: "challenged"`.
+  `error: "challenged"`. A challenge is **not a failure**: it gets the
+  status's TTL (403 → 6 h), not the 15-minute outage backoff, which would
+  only hit the sites that already block us more often.
 - `429`: honor `Retry-After` (default 1 h if it is missing) by setting
-  `hosts.backoff_until`. The URL is rescheduled, and the 429 is **not**
-  recorded as the URL's result.
+  `hosts.backoff_until` for the host that answered 429, and for the URL's own
+  host if a redirect led elsewhere. The 429 is **not** recorded as the URL's
+  result. The host's pending URLs are pushed past the backoff and **spaced
+  60 s apart**, so they come back at the scheduler's pace instead of all at
+  once. New URLs submitted for a host in backoff start after it ends.
 
 ### 6.2 TTL by outcome
 
@@ -299,6 +323,7 @@ The next check is scheduled at `checked_at + TTL × jitter(0.9–1.1)`.
 | 3xx (final, unresolved)       | 24 h                                    |
 | 4xx (except 429)              | 6 h, so fixes are seen quickly          |
 | 5xx, timeout, connect, dns, tls | 15 min × 2^(failures−1), capped at 24 h |
+| bot challenge (`challenged`)  | the status's TTL (403 → 6 h); not a failure |
 
 These are defaults. A per-host override (and later per-URL tuning) can be
 added through the `hosts` table.
@@ -343,26 +368,39 @@ When one request adds several new URLs for the same host, they are inserted
 with `next_check_at` spaced **60 s apart**. A project adding 3,000 GitHub
 links therefore trickles out instead of clogging the head of the queue.
 
-Each tick (every minute), the scheduler:
+Each tick (every minute except maintenance minutes), the scheduler:
 
 1. reads up to 200 never-checked due URLs and up to 200 due URLs of any
    kind, both ordered by `next_check_at` (hot URLs come early because they
-   are scheduled at 80% of their TTL),
-2. skips hosts that are backing off,
-3. takes at most one URL per host and at most 20 in total,
-4. checks them, at most 6 at a time and within the fetch budget, and
-   writes all results in one statement.
+   are scheduled at 80% of their TTL);
+2. skips hosts that are backing off, and takes at most one URL per host and
+   at most **10** in total;
+3. if one host's backlog filled the whole window, so that the batch isn't
+   full, runs a **second query that excludes the hosts already seen**.
+   Without it, a host with hundreds of due URLs (e.g. after a 429, or a big
+   github.com batch) would leave every tick checking one URL;
+4. **claims** the picked URLs (`next_check_at = now + 10 min`) before
+   fetching. If the invocation is killed mid-tick, they come back in 10
+   minutes instead of staying at the head of the queue and getting the next
+   tick killed too;
+5. checks them in **waves** of 6 concurrent fetches, within the fetch budget
+   and deadline, and **writes each wave's results right away**. A killed tick
+   loses at most one wave. Deferred URLs are released (due now) again.
 
-On a 429, the host's `backoff_until` is set, and **all** of that host's
-pending URLs are pushed past it.
+A host never gets more than one check per minute, so a host with a long
+queue drains at that rate. That is its real throughput, not a bug, and the
+watcher's "overdue" times for such a host reflect it.
 
 ## 7. Security & abuse
 
 - Only `http`/`https`. Reject URLs that are longer than 2048 chars or that
   carry credentials (`user:pass@`).
-- Reject literal IPs in private, loopback and link-local ranges, and
-  `localhost`. (Workers egress cannot reach private networks anyway, but the
-  service should not depend on that.)
+- Reject literal IPs in private, loopback, link-local, benchmarking
+  (198.18/15), 192.0.0/24 and multicast ranges, IPv6 unique-local,
+  link-local, multicast, NAT64 (`64:ff9b::`), 6to4 (`2002::`) and
+  IPv4-mapped/-compatible forms, and `localhost`. Trailing dots are stripped
+  from host names (`example.org.` is `example.org`). (Workers egress cannot
+  reach private networks anyway, but the service should not depend on that.)
 - Per-key **new-URL quota per day**. It limits how far the service can be
   used to amplify traffic toward arbitrary targets. Lookups of URLs that are
   already known are cheap and limited only by the request rate.
@@ -374,8 +412,8 @@ pending URLs are pushed past it.
   embed tokens, signed parameters or personal data. The service can't detect
   secrets in URLs, so this rests on policy. If something sensitive does get
   submitted, delete the row
-  (`wrangler d1 execute … "DELETE FROM urls WHERE url = …"`); the next hourly
-  snapshot drops it. Consider revoking the key that submitted it.
+  (`wrangler d1 execute … "DELETE FROM urls WHERE url = …"`); the next
+  snapshot rebuild drops it. Consider revoking the key that submitted it.
 - Keys are stored as hashes, can be revoked, and are issued by an admin.
 - OIDC trusts GitHub's signature plus our allowlist (by numeric id). The
   `id-token: write` permission lets a job mint tokens for *any* audience, so
@@ -388,15 +426,23 @@ pending URLs are pushed past it.
   (cron `* * * * *`).
 - The admin credential is the `ADMIN_TOKEN` Worker secret. Keys created with
   `"admin": true` are admins too.
-- Minute 0 of every hour runs **maintenance** instead of a checking tick. It
-  recomputes the full counts and rebuilds the public snapshot. At 03:00 UTC
-  it also drops URLs that have not been requested for 30 days. Keeping these
-  full-table scans out of checking ticks keeps the per-invocation query
-  budget for checks. Logs a `maintenance {...}` line.
+- Minutes divisible by `maintenanceEveryMinutes` (10 for now, while things
+  settle, then back to 60) run **maintenance** instead of a checking tick. So
+  does the first cron run of a new deployment: the `version_metadata` binding
+  gives the version id, which is compared with the last one stored in
+  `meta`. Maintenance recomputes the full counts and rebuilds the public
+  snapshot. At 03:00 UTC it also drops URLs that have not been requested for
+  30 days. Keeping these full-table scans out of checking ticks keeps the
+  per-invocation query budget for checks. Logs a `maintenance <reason> {...}`
+  line.
+- The scheduled handler **awaits** its job (not just `waitUntil`) and
+  rethrows errors after logging them, so failed runs show as failed in
+  Cloudflare's dashboard and `wrangler tail`.
 - Every other minute, the tick logs one `tick {...}` line (`wrangler tail`),
   stores its report, and adds to the recent-checks log in `meta`.
-- Bindings: `DB` (D1), `SNAPSHOT` (KV, optional in code; without it no
-  snapshot is built and the endpoint returns `503`).
+- Bindings: `DB` (D1); `SNAPSHOT` (KV, optional in code; without it no
+  snapshot is built and the endpoint returns `503`); `CF_VERSION_METADATA`
+  (version metadata, for rebuild-on-deploy).
 - Monitoring: `tools/lcp_status.py`, run under `watch`, shows the counts, the
   queue head and recent checks, from `/v1/admin/overview`. It flags a stalled
   cron when the last tick is more than 3 minutes old.

@@ -154,22 +154,30 @@ async function check(req: Request, caller: Caller, deps: ApiDeps): Promise<Respo
         ? { id: caller.grant.usageId, limit: caller.grant.quota }
         : null; // bootstrap admin: unlimited
 
-  // New URLs, subject to the caller's daily quota.
+  // New URLs, subject to the caller's daily quota (reserved atomically).
   let fresh = [...unique.keys()].filter((u) => !known.has(u));
   const overQuota = new Set<string>();
   const notQueued = new Set<string>();
+  const day = new Date(nowMs).toISOString().slice(0, 10);
+  let granted = fresh.length;
   if (readOnly) {
     for (const u of fresh) notQueued.add(u);
     fresh = [];
   } else if (fresh.length > 0 && quota) {
-    const day = new Date(nowMs).toISOString().slice(0, 10);
-    const used = await store.newUrlsUsed(quota.id, day);
-    const allowed = Math.max(0, quota.limit - used);
-    for (const u of fresh.slice(allowed)) overQuota.add(u);
-    fresh = fresh.slice(0, allowed);
-    await store.addNewUrlsUsed(quota.id, day, fresh.length);
+    granted = await store.reserveNewUrls(quota.id, day, fresh.length, quota.limit);
+    for (const u of fresh.slice(granted)) overQuota.add(u);
+    fresh = fresh.slice(0, granted);
   }
-  await store.insertNew(spreadNewUrls(fresh, unique, now, cfg.newUrlHostSpacing), now);
+  if (fresh.length > 0) {
+    // Hosts backing off from a 429: new URLs start after the backoff.
+    const backoff = await store.hostsInBackoff([...new Set(fresh.map((u) => unique.get(u)!))], now);
+    const inserted = await store.insertNew(
+      spreadNewUrls(fresh, unique, now, cfg.newUrlHostSpacing, backoff),
+      now,
+    );
+    // Don't charge for rows a concurrent request inserted first.
+    if (quota && inserted < fresh.length) await store.addNewUrlsUsed(quota.id, day, inserted - fresh.length);
+  }
 
   const toTouch = [...known.values()]
     .filter((r) => r.last_requested_at < now - cfg.requestTouchInterval)
@@ -193,13 +201,15 @@ export function spreadNewUrls(
   hostOf: Map<string, string>,
   now: number,
   spacing: number,
+  backoffUntil: Map<string, number> = new Map(),
 ): NewUrl[] {
   const perHost = new Map<string, number>();
   return urls.map((url) => {
     const host = hostOf.get(url)!;
     const k = perHost.get(host) ?? 0;
     perHost.set(host, k + 1);
-    return { url, host, next_check_at: now + k * spacing };
+    const start = Math.max(now, backoffUntil.get(host) ?? 0);
+    return { url, host, next_check_at: start + k * spacing };
   });
 }
 
@@ -225,7 +235,9 @@ async function single(url: URL, deps: ApiDeps): Promise<Response> {
 
 async function serveSnapshot(req: Request, deps: ApiDeps): Promise<Response> {
   const body = deps.snapshot ? await deps.snapshot() : null;
-  if (body === null) return err(503, "snapshot not generated yet; it is rebuilt hourly");
+  if (body === null) {
+    return err(503, `snapshot not generated yet; it is rebuilt every ${deps.cfg.maintenanceEveryMinutes} minutes`);
+  }
   const etag = `"snap-${snapshotGeneratedAt(body) ?? body.length}"`;
   const headers = {
     "content-type": "application/json",
@@ -240,7 +252,7 @@ async function serveSnapshot(req: Request, deps: ApiDeps): Promise<Response> {
 const DUE_COUNT_CAP = 1000;
 
 /**
- * Cheap dashboard data: cached stats (refreshed hourly by the cron tick),
+ * Cheap dashboard data: cached stats (refreshed by each maintenance run),
  * the recent-checks log, and the head of the schedule. Safe to poll.
  */
 async function overview(url: URL, deps: ApiDeps): Promise<Response> {
@@ -267,8 +279,10 @@ async function overview(url: URL, deps: ApiDeps): Promise<Response> {
       count_cap: DUE_COUNT_CAP,
       never_checked: due.unknown,
       never_checked_due: due.unknown_due,
-      refresh_due: Math.max(0, due.due - due.unknown_due),
+      refresh_due: due.refresh_due,
       checks_per_tick: deps.cfg.checksPerTick,
+      // Cron runs every minute; these minutes do maintenance instead.
+      maintenance_every_minutes: deps.cfg.maintenanceEveryMinutes,
     },
     upcoming: upcoming.map((r) => ({
       url: r.url,

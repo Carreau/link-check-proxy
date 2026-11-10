@@ -53,12 +53,13 @@ async function sign(c: object, opts: { kid?: string; key?: CryptoKey; alg?: stri
   return `${head}.${body}.${b64url(new Uint8Array(sig))}`;
 }
 
-function cache() {
+function cache(opts: { fail?: () => boolean; clock?: () => number } = {}) {
   let fetches = 0;
   const c = new JwksCache(async () => {
     fetches++;
+    if (opts.fail?.()) throw new Error("github down");
     return new Response(jwksBody);
-  }, () => NOW * 1000);
+  }, opts.clock ?? (() => NOW * 1000));
   return { c, fetches: () => fetches };
 }
 
@@ -96,13 +97,33 @@ describe("verifyGithubToken", () => {
   });
 
   it("caches keys and limits refetches on unknown kids", async () => {
-    const { c, fetches } = cache();
+    let t = NOW * 1000;
+    const { c, fetches } = cache({ clock: () => t });
     await verifyGithubToken(await sign(claims()), c.lookup, NOW);
     await verifyGithubToken(await sign(claims()), c.lookup, NOW);
     expect(fetches()).toBe(1);
+    // Unknown kid right after a fetch: no refetch (keys are fresh).
+    await verifyGithubToken(await sign(claims(), { kid: "x" }), c.lookup, NOW);
+    expect(fetches()).toBe(1);
+    t += 61_000;
     await verifyGithubToken(await sign(claims(), { kid: "x" }), c.lookup, NOW);
     await verifyGithubToken(await sign(claims(), { kid: "y" }), c.lookup, NOW);
     expect(fetches()).toBe(2); // one miss-refetch per minute
+  });
+
+  it("keeps using cached keys when a refresh fails", async () => {
+    let t = NOW * 1000;
+    let down = false;
+    const { c } = cache({ clock: () => t, fail: () => down });
+    expect(await verifyGithubToken(await sign(claims()), c.lookup, NOW)).not.toBeNull();
+    down = true;
+    t += 2 * 3600_000; // cache is stale, GitHub unreachable
+    expect(await verifyGithubToken(await sign(claims()), c.lookup, NOW)).not.toBeNull();
+  });
+
+  it("with no cached keys, a failed fetch rejects (401 upstream)", async () => {
+    const { c } = cache({ fail: () => true });
+    await expect(verifyGithubToken(await sign(claims()), c.lookup, NOW)).rejects.toThrow(/github down/);
   });
 });
 

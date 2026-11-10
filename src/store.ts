@@ -54,9 +54,10 @@ export class Store {
     return new Map(results.map((r) => [r.url, r]));
   }
 
-  async insertNew(rows: NewUrl[], now: number): Promise<void> {
-    if (rows.length === 0) return;
-    await this.db
+  /** Insert URLs not yet known; returns how many were actually inserted. */
+  async insertNew(rows: NewUrl[], now: number): Promise<number> {
+    if (rows.length === 0) return 0;
+    const r = await this.db
       .prepare(
         `INSERT OR IGNORE INTO urls (url, host, next_check_at, first_seen_at, last_requested_at, request_count)
          SELECT json_extract(value, '$.url'), json_extract(value, '$.host'),
@@ -65,6 +66,7 @@ export class Store {
       )
       .bind(now, JSON.stringify(rows))
       .run();
+    return r.meta.changes ?? 0;
   }
 
   /**
@@ -93,8 +95,12 @@ export class Store {
 
   // ---- URLs (scheduler side) ----
 
-  /** Due URLs, never-checked first, then by next_check_at. May contain duplicates. */
-  async dueCandidates(now: number, limit: number): Promise<UrlRow[]> {
+  /**
+   * Due URLs, never-checked first, then by next_check_at. May contain
+   * duplicates. `full` says a query hit its limit, i.e. there may be more
+   * due rows than we looked at (see dueExcludingHosts).
+   */
+  async dueCandidates(now: number, limit: number): Promise<{ rows: UrlRow[]; full: boolean }> {
     const [unknown, due] = await this.db.batch([
       this.db
         .prepare(
@@ -106,10 +112,36 @@ export class Store {
         .prepare(`SELECT ${URL_COLS} FROM urls WHERE next_check_at <= ? ORDER BY next_check_at LIMIT ?`)
         .bind(now, limit),
     ]);
-    return [
-      ...((unknown as { results: UrlRow[] }).results ?? []),
-      ...((due as { results: UrlRow[] }).results ?? []),
-    ];
+    const u = (unknown as { results: UrlRow[] }).results ?? [];
+    const d = (due as { results: UrlRow[] }).results ?? [];
+    return { rows: [...u, ...d], full: u.length >= limit || d.length >= limit };
+  }
+
+  /**
+   * Due URLs of hosts *other than* `hosts`, by next_check_at. Used when one
+   * host's backlog fills the whole first window, so other hosts still get
+   * their turn. Skipped rows of excluded hosts still count as reads, but only
+   * on ticks where the window was full.
+   */
+  async dueExcludingHosts(now: number, hosts: string[], limit: number): Promise<UrlRow[]> {
+    const { results } = await this.db
+      .prepare(
+        `SELECT ${URL_COLS} FROM urls
+         WHERE next_check_at <= ? AND host NOT IN (SELECT value FROM json_each(?))
+         ORDER BY next_check_at LIMIT ?`,
+      )
+      .bind(now, JSON.stringify(hosts), limit)
+      .all<UrlRow>();
+    return results;
+  }
+
+  /** Set next_check_at for URLs (claim before fetching, release on deferral). */
+  async setNextCheck(urls: string[], at: number): Promise<void> {
+    if (urls.length === 0) return;
+    await this.db
+      .prepare(`UPDATE urls SET next_check_at = ? WHERE url IN (SELECT value FROM json_each(?))`)
+      .bind(at, JSON.stringify(urls))
+      .run();
   }
 
   async applyResults(updates: ResultUpdate[]): Promise<void> {
@@ -132,18 +164,6 @@ export class Store {
       .run();
   }
 
-  /** Postpone URLs that were picked but not completed (e.g. rate limited). */
-  async postpone(urls: string[], until: number): Promise<void> {
-    if (urls.length === 0) return;
-    await this.db
-      .prepare(
-        `UPDATE urls SET next_check_at = MAX(next_check_at, ?)
-         WHERE url IN (SELECT value FROM json_each(?))`,
-      )
-      .bind(until, JSON.stringify(urls))
-      .run();
-  }
-
   async dropIdle(cutoff: number): Promise<number> {
     const r = await this.db.prepare(`DELETE FROM urls WHERE last_requested_at < ?`).bind(cutoff).run();
     return r.meta.changes ?? 0;
@@ -151,19 +171,26 @@ export class Store {
 
   // ---- Hosts ----
 
-  async hostsInBackoff(hosts: string[], now: number): Promise<Set<string>> {
-    if (hosts.length === 0) return new Set();
+  /** Hosts currently backing off, with the time their backoff ends. */
+  async hostsInBackoff(hosts: string[], now: number): Promise<Map<string, number>> {
+    if (hosts.length === 0) return new Map();
     const { results } = await this.db
       .prepare(
-        `SELECT host FROM hosts WHERE backoff_until > ? AND host IN (SELECT value FROM json_each(?))`,
+        `SELECT host, backoff_until FROM hosts
+         WHERE backoff_until > ? AND host IN (SELECT value FROM json_each(?))`,
       )
       .bind(now, JSON.stringify(hosts))
-      .all<{ host: string }>();
-    return new Set(results.map((r) => r.host));
+      .all<{ host: string; backoff_until: number }>();
+    return new Map(results.map((r) => [r.host, r.backoff_until]));
   }
 
-  /** Back off hosts and push all their pending URLs past the backoff. */
-  async backoffHosts(backoffs: { host: string; until: number }[]): Promise<void> {
+  /**
+   * Back off hosts and push their pending URLs past the backoff, spaced
+   * `spacing` seconds apart in their current order, so they trickle back at
+   * the scheduler's 1-per-host pace instead of all becoming due at once
+   * (which would flood the candidate window). Uses urls_host_next.
+   */
+  async backoffHosts(backoffs: { host: string; until: number }[], spacing: number): Promise<void> {
     if (backoffs.length === 0) return;
     const json = JSON.stringify(backoffs);
     await this.db.batch([
@@ -176,10 +203,16 @@ export class Store {
         .bind(json),
       this.db
         .prepare(
-          `UPDATE urls SET next_check_at = MAX(next_check_at, json_extract(j.value, '$.until'))
-           FROM json_each(?) AS j WHERE urls.host = json_extract(j.value, '$.host')`,
+          `UPDATE urls SET next_check_at = s.t
+           FROM (SELECT u.url AS url,
+                        b.until + ?2 * (ROW_NUMBER() OVER (PARTITION BY u.host ORDER BY u.next_check_at, u.url) - 1) AS t
+                 FROM urls u
+                 JOIN (SELECT json_extract(value, '$.host') AS host, json_extract(value, '$.until') AS until
+                       FROM json_each(?1)) AS b ON u.host = b.host
+                 WHERE u.next_check_at < b.until) AS s
+           WHERE urls.url = s.url`,
         )
-        .bind(json),
+        .bind(json, spacing),
     ]);
   }
 
@@ -220,6 +253,28 @@ export class Store {
     return (r.meta.changes ?? 0) > 0;
   }
 
+  /**
+   * Atomically reserve up to `n` new URLs against a daily quota; returns how
+   * many were granted. The increment happens first (D1 serializes writes),
+   * so concurrent requests can't both see the old total; any excess is
+   * handed back.
+   */
+  async reserveNewUrls(keyId: string, day: string, n: number, quota: number): Promise<number> {
+    if (n <= 0) return 0;
+    const r = await this.db
+      .prepare(
+        `INSERT INTO api_key_usage (key_id, day, new_urls) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key_id, day) DO UPDATE SET new_urls = new_urls + ?3
+         RETURNING new_urls`,
+      )
+      .bind(keyId, day, n)
+      .first<{ new_urls: number }>();
+    const over = Math.max(0, (r?.new_urls ?? n) - quota);
+    const refund = Math.min(n, over);
+    if (refund > 0) await this.addNewUrlsUsed(keyId, day, -refund);
+    return n - refund;
+  }
+
   async newUrlsUsed(keyId: string, day: string): Promise<number> {
     const r = await this.db
       .prepare(`SELECT new_urls FROM api_key_usage WHERE key_id = ? AND day = ?`)
@@ -228,8 +283,9 @@ export class Store {
     return r?.new_urls ?? 0;
   }
 
+  /** Adjust the day's count by `n` (negative to refund). */
   async addNewUrlsUsed(keyId: string, day: string, n: number): Promise<void> {
-    if (n <= 0) return;
+    if (n === 0) return;
     await this.db
       .prepare(
         `INSERT INTO api_key_usage (key_id, day, new_urls) VALUES (?1, ?2, ?3)
@@ -295,17 +351,28 @@ export class Store {
    * Queue sizes for the overview, each counting at most `cap` rows via an
    * index: due now (any), never checked (total), never checked and due.
    */
-  async queueCounts(now: number, cap: number): Promise<{ due: number; unknown: number; unknown_due: number }> {
+  async queueCounts(
+    now: number,
+    cap: number,
+  ): Promise<{ due: number; unknown: number; unknown_due: number; refresh_due: number }> {
+    // Each count is capped independently (a difference of capped counts
+    // would be wrong once either hits the cap).
     const r = await this.db
       .prepare(
         `SELECT
            (SELECT COUNT(*) FROM (SELECT 1 FROM urls WHERE next_check_at <= ?1 LIMIT ?2)) AS due,
            (SELECT COUNT(*) FROM (SELECT 1 FROM urls WHERE checked_at IS NULL LIMIT ?2)) AS unknown,
-           (SELECT COUNT(*) FROM (SELECT 1 FROM urls WHERE checked_at IS NULL AND next_check_at <= ?1 LIMIT ?2)) AS unknown_due`,
+           (SELECT COUNT(*) FROM (SELECT 1 FROM urls WHERE checked_at IS NULL AND next_check_at <= ?1 LIMIT ?2)) AS unknown_due,
+           (SELECT COUNT(*) FROM (SELECT 1 FROM urls WHERE checked_at IS NOT NULL AND next_check_at <= ?1 LIMIT ?2)) AS refresh_due`,
       )
       .bind(now, cap)
-      .first<{ due: number; unknown: number; unknown_due: number }>();
-    return { due: r?.due ?? 0, unknown: r?.unknown ?? 0, unknown_due: r?.unknown_due ?? 0 };
+      .first<{ due: number; unknown: number; unknown_due: number; refresh_due: number }>();
+    return {
+      due: r?.due ?? 0,
+      unknown: r?.unknown ?? 0,
+      unknown_due: r?.unknown_due ?? 0,
+      refresh_due: r?.refresh_due ?? 0,
+    };
   }
 
   /**
@@ -334,7 +401,7 @@ export class Store {
     return { obj: r?.obj ?? "{}", last: r?.last ?? null, n: r?.n ?? 0 };
   }
 
-  /** Full-table counts. Reads every row: call rarely (hourly maintenance). */
+  /** Full-table counts. Reads every row: call rarely (maintenance only). */
   async stats(now: number): Promise<Record<string, number>> {
     const r = await this.db
       .prepare(

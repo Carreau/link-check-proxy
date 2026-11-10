@@ -66,7 +66,7 @@ describe("checkUrl", () => {
   it("reports 429 as rate_limited with Retry-After", async () => {
     const f = fakeFetch({ "https://a.org/": () => res(429, { "retry-after": "300" }) });
     const o = await checkUrl("https://a.org/", f.fn, new Budget(10), cfg);
-    expect(o).toEqual({ kind: "rate_limited", retryAfter: 300 });
+    expect(o).toEqual({ kind: "rate_limited", retryAfter: 300, host: "a.org" });
   });
 
   it("flags Cloudflare challenges", async () => {
@@ -75,12 +75,48 @@ describe("checkUrl", () => {
     expect(o).toMatchObject({ status: 403, error: "challenged" });
   });
 
-  it("classifies network errors, retrying with GET", async () => {
+  it("does not retry DNS/timeout/TLS errors with GET", async () => {
     const e = Object.assign(new TypeError("fetch failed"), { cause: { code: "ENOTFOUND" } });
     const f = fakeFetch({ "https://nope.example/": () => e });
     const o = await checkUrl("https://nope.example/", f.fn, new Budget(10), cfg);
     expect(o).toMatchObject({ kind: "result", status: null, error: "dns" });
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it("retries connection errors with GET", async () => {
+    const e = Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } });
+    const f = fakeFetch({ "https://a.org/": (m) => (m === "HEAD" ? e : res(200)) });
+    const o = await checkUrl("https://a.org/", f.fn, new Budget(10), cfg);
+    expect(o).toMatchObject({ kind: "result", status: 200 });
     expect(f.calls).toHaveLength(2);
+  });
+
+  it("reports the host that said 429 after a redirect", async () => {
+    const f = fakeFetch({
+      "https://a.org/x": () => res(301, { location: "https://b.org/y" }),
+      "https://b.org/y": () => res(429),
+    });
+    const o = await checkUrl("https://a.org/x", f.fn, new Budget(10), cfg);
+    expect(o).toEqual({ kind: "rate_limited", retryAfter: null, host: "b.org" });
+  });
+
+  it("defers instead of starting fetches past the tick deadline", async () => {
+    let t = 0;
+    const f = fakeFetch({ "https://a.org/": () => res(200) });
+    const budget = new Budget(10, 1000, () => t);
+    t = 1000;
+    expect(await checkUrl("https://a.org/", f.fn, budget, cfg)).toEqual({ kind: "deferred" });
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("a timeout cut short by the deadline is deferred, not recorded", async () => {
+    let t = 0;
+    const timeout = Object.assign(new Error("t"), { name: "TimeoutError" });
+    const f = fakeFetch({ "https://a.org/": () => timeout });
+    // Only 1 s left of the tick, less than the 5 s fetch timeout.
+    expect(await checkUrl("https://a.org/", f.fn, new Budget(10, 1000, () => t), cfg)).toEqual({ kind: "deferred" });
+    // With plenty of time left, a timeout is a real result.
+    expect(await checkUrl("https://a.org/", f.fn, new Budget(10, 60_000, () => t), cfg)).toMatchObject({ error: "timeout" });
   });
 
   it("defers when the fetch budget runs out", async () => {
