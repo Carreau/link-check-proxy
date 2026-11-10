@@ -8,8 +8,7 @@ crons = ["* * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "link-check-proxy"
-# Fill in after `npx wrangler d1 create link-check-proxy`.
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "b7f6f64f-2153-4c76-a1cf-49f7608ab463"
 migrations_dir = "migrations"
 
 # Secrets (set with `npx wrangler secret put ADMIN_TOKEN`):
