@@ -3,6 +3,7 @@ import { bearerToken, generateApiKey, randomToken, sha256Hex, timingSafeEqualHex
 import type { Config } from "./config.js";
 import { publicResult, rejectedResult } from "./policy.js";
 import type { ApiKeyRow, NewUrl, Store } from "./store.js";
+import type { RecentCheck, TickReport } from "./scheduler.js";
 import type { PublicResult } from "./types.js";
 import { normalizeUrl } from "./url.js";
 
@@ -50,6 +51,7 @@ export async function handleRequest(req: Request, deps: ApiDeps): Promise<Respon
         const ok = await deps.store.revokeKey(m[1]!, Math.floor(deps.nowMs() / 1000));
         return ok ? json({ revoked: m[1] }) : err(404, "no such active key");
       }
+      if (path === "/v1/admin/overview" && req.method === "GET") return await overview(url, deps);
       if (path === "/v1/admin/stats" && req.method === "GET") {
         return json(await deps.store.stats(Math.floor(deps.nowMs() / 1000)));
       }
@@ -165,6 +167,42 @@ async function single(url: URL, deps: ApiDeps): Promise<Response> {
           last_requested_at: new Date(row.last_requested_at * 1000).toISOString(),
         }
       : null,
+  });
+}
+
+const DUE_COUNT_CAP = 1000;
+
+/**
+ * Cheap dashboard data: cached stats (refreshed hourly by the cron tick),
+ * the recent-checks log, and the head of the schedule. Safe to poll.
+ */
+async function overview(url: URL, deps: ApiDeps): Promise<Response> {
+  const { store } = deps;
+  const now = Math.floor(deps.nowMs() / 1000);
+  const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 20, 1), 100);
+  const [stats, lastTick, recent, upcoming, due] = await Promise.all([
+    store.getMeta<Record<string, number>>("stats"),
+    store.getMeta<TickReport>("last_tick"),
+    store.getMeta<RecentCheck[]>("recent"),
+    store.upcoming(limit),
+    store.dueCount(now, DUE_COUNT_CAP),
+  ]);
+  return json({
+    now,
+    stats: stats ? { ...stats.value, computed_at: stats.updated_at } : null,
+    last_tick: lastTick ? { ...lastTick.value, at: lastTick.updated_at } : null,
+    due_now: due,
+    due_capped: due >= DUE_COUNT_CAP,
+    upcoming: upcoming.map((r) => ({
+      url: r.url,
+      state: publicResult(r, now).state,
+      status: r.status,
+      error: r.error,
+      checked_at: r.checked_at,
+      next_check_at: r.next_check_at,
+      idle_level: r.idle_level,
+    })),
+    recent: (recent?.value ?? []).slice(0, limit),
   });
 }
 

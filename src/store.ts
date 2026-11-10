@@ -239,8 +239,47 @@ export class Store {
       .run();
   }
 
+  // ---- Meta (cached stats, recent activity) ----
+
+  async getMeta<T>(key: string): Promise<{ value: T; updated_at: number } | null> {
+    const r = await this.db
+      .prepare(`SELECT value, updated_at FROM meta WHERE key = ?`)
+      .bind(key)
+      .first<{ value: string; updated_at: number }>();
+    return r ? { value: JSON.parse(r.value) as T, updated_at: r.updated_at } : null;
+  }
+
+  async setMeta(key: string, value: unknown, now: number): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO meta (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .bind(key, JSON.stringify(value), now)
+      .run();
+  }
+
   // ---- Stats ----
 
+  /** Next URLs in schedule order. Index range scan: reads `limit` rows. */
+  async upcoming(limit: number): Promise<UrlRow[]> {
+    const { results } = await this.db
+      .prepare(`SELECT ${URL_COLS} FROM urls ORDER BY next_check_at LIMIT ?`)
+      .bind(limit)
+      .all<UrlRow>();
+    return results;
+  }
+
+  /** Number of due URLs, counting at most `cap` rows. */
+  async dueCount(now: number, cap: number): Promise<number> {
+    const r = await this.db
+      .prepare(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM urls WHERE next_check_at <= ? LIMIT ?)`)
+      .bind(now, cap)
+      .first<{ n: number }>();
+    return r?.n ?? 0;
+  }
+
+  /** Full-table counts. Reads every row: call rarely (see refreshStats). */
   async stats(now: number): Promise<Record<string, number>> {
     const r = await this.db
       .prepare(

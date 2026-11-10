@@ -1,6 +1,6 @@
 # link-check-proxy — Design Document
 
-Status: **v0.3**, initial implementation (2026-11-10)
+Status: **v0.4**, deployed; monitoring CLI added (2026-11-10)
 
 Audience: a small, community-run service for Jupyter and Scientific Python
 projects (NumPy, SciPy, …). Keep it simple; scale later.
@@ -147,18 +147,29 @@ check history summary (next scheduled check, idle level).
 - `POST /v1/admin/keys` with `{name, owner, quota}` → `{id, key}`. The
   plaintext key is shown only this once.
 - `GET /v1/admin/keys`, `DELETE /v1/admin/keys/:id` (revoke)
-- `GET /v1/admin/stats`: URL counts by state, queue depth, checks/day, top
-  hosts.
+- `GET /v1/admin/overview?limit=N`: cheap, safe to poll. It returns:
+  - the cached full counts (recomputed hourly by the cron job),
+  - the last tick's report,
+  - the number of due URLs (counted up to 1000),
+  - the next N URLs in schedule order,
+  - the last N checks (a log of the most recent 100, kept in the `meta`
+    table).
+
+  `tools/lcp_status.py` renders it for `watch`.
+- `GET /v1/admin/stats`: live URL counts by state. It scans the whole table,
+  so don't poll it.
 
 ## 5. Data model
 
-The schema lives in `migrations/0001_init.sql`. It has four tables:
+The schema lives in `migrations/`. It has five tables:
 
 - `urls`: one row per normalized URL (fragment stripped). It holds the last
   result (`status`, `error`, `final_url`, `checked_at`, `expires_at`) and the
   scheduling state (`next_check_at`, `last_requested_at`, `request_count`,
   `consecutive_failures`, `idle_level`). It is indexed on `next_check_at`,
   plus a partial index for never-checked rows.
+- `meta`: small JSON key/value entries (cached stats, last tick, recent
+  checks) for the admin overview.
 - `hosts`: `backoff_until` for each host, set from 429 / `Retry-After`. This
   is also where per-host policy overrides will go later.
 - `api_keys`: keys stored as SHA-256 hashes, each with an `is_admin` flag, a
@@ -294,7 +305,14 @@ pending URLs are pushed past it.
   `"admin": true` are admins too.
 - URLs that have not been requested for 30 days are dropped once a day, by
   the tick at 03:00 UTC.
-- Observability: one log line per tick, and a `/v1/admin/stats` endpoint.
+- Every tick logs one `tick {...}` line (`wrangler tail`). It also stores its
+  report and adds to the recent-checks log in `meta`. The tick at minute 0 of
+  each hour recomputes the full counts.
+- Monitoring: `tools/lcp_status.py`, run under `watch`, shows the counts, the
+  queue head and recent checks, from `/v1/admin/overview`. It flags a stalled
+  cron when the last tick is more than 3 minutes old.
+- Schema changes are new numbered files in `migrations/`. Apply them
+  **before** deploying the code that needs them.
 - Tests (`npm test`): unit tests for the pure policy, URL and checker logic,
   plus end-to-end tests of the API and scheduler. These run against the real
   migration on `node:sqlite`, through a small D1-compatible shim.

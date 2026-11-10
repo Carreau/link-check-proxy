@@ -202,3 +202,32 @@ describe("scheduler", () => {
     expect(r).toMatchObject({ picked: 4, results: 3, deferred: 1 });
   });
 });
+
+describe("admin overview", () => {
+  it("reports cached stats, last tick, upcoming and recent checks", async () => {
+    const key = await newKey();
+    await check(key, ["https://a.org/", "https://b.org/x", "https://c.org/"]);
+
+    const before = await call("GET", "/v1/admin/overview?limit=10", ADMIN);
+    const b = (await before.json()) as any;
+    expect(b.stats).toBeNull();
+    expect(b.last_tick).toBeNull();
+    expect(b.due_now).toBe(3);
+    expect(b.upcoming.map((u: any) => u.state)).toEqual(["unknown", "unknown", "unknown"]);
+
+    await tick(okFetch({ "https://b.org/x": 404 }));
+    clock += 60_000;
+
+    const after = (await (await call("GET", "/v1/admin/overview", ADMIN)).json()) as any;
+    expect(after.stats).toMatchObject({ urls: 3, fresh: 3, unknown: 0 });
+    expect(after.last_tick).toMatchObject({ picked: 3, results: 3 });
+    expect(after.due_now).toBe(0);
+    expect(after.recent).toHaveLength(3);
+    expect(after.recent.find((r: any) => r.url === "https://b.org/x")).toMatchObject({ status: 404, kind: "result" });
+    // 4xx has the shortest TTL, so it is next in line.
+    expect(after.upcoming[0].url).toBe("https://b.org/x");
+
+    const key2 = await newKey();
+    expect((await call("GET", "/v1/admin/overview", key2)).status).toBe(403);
+  });
+});

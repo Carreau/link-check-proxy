@@ -24,6 +24,8 @@ export default {
     const when = new Date(controller.scheduledTime);
     // Drop long-unrequested URLs once a day.
     const dropIdle = when.getUTCHours() === 3 && when.getUTCMinutes() === 0;
+    // Full-table stats for the admin overview, hourly.
+    const refreshStats = when.getUTCMinutes() === 0;
     ctx.waitUntil(
       runTick({
         store: store(env),
@@ -31,6 +33,7 @@ export default {
         cfg: DEFAULT_CONFIG,
         nowMs: controller.scheduledTime,
         dropIdle,
+        refreshStats,
       }).then(
         (r) => console.log("tick", JSON.stringify(r)),
         (e) => console.error("tick failed", e),
