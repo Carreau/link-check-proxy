@@ -145,7 +145,8 @@ export function homePage(origin: string, cfg: Config): string {
                      | select(.value.state == "fresh" and (.value.status == 404 or .value.status == 410))
                      | "BROKEN \\(.key)"' | tee broken.txt
           test ! -s broken.txt   # fail the job if any link is broken</code></pre>
-<p class="note">Using an API key instead? Drop the token lines and send <code>Authorization: Bearer $LCP_API_KEY</code> from a secret. Plugins for Sphinx and other link checkers may come later. Until then, each project wires up the call itself.</p>
+<p class="note">Using an API key instead? Drop the token lines and send <code>Authorization: Bearer $LCP_API_KEY</code> from a secret.</p>
+<p><strong>A complete real-world example:</strong> <a href="https://github.com/Quansight-Labs/intersphinx_registry/pull/129">intersphinx_registry #129</a> wires this into a pytest suite. It queries the proxy once per session with a GitHub OIDC token, falls back to the public snapshot on fork PRs, and only generates live tests for URLs the proxy can't vouch for. Its <code>tests/linkcheck_proxy.py</code> is self-contained and easy to copy. A reusable package may follow.</p>
 
 <h2 id="snapshot">Public snapshot (no key needed)</h2>
 <p>Every ${cfg.maintenanceEveryMinutes} minutes, and after each deployment, the service publishes all of its results as one JSON file: <a href="${o}/v1/snapshot.json"><code>/v1/snapshot.json</code></a>. Callers without a key, such as CI on pull requests from forks, can download it and look up their URLs locally. Fetching the snapshot never adds URLs and never triggers a check. URLs that aren't in it are simply unknown, so check those yourself.</p>

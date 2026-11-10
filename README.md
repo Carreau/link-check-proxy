@@ -5,7 +5,9 @@ Python ecosystem. Instead of every CI run hitting every external URL, clients
 ask this service, which answers right away from its cache and checks the URLs
 itself in the background, slowly and politely.
 
-For the design, see [PROJECT.md](PROJECT.md). Using the service from your
+For the design, see [PROJECT.md](PROJECT.md). For a complete client example
+(pytest, GitHub OIDC, public-snapshot fallback for fork PRs), see
+[intersphinx_registry #129](https://github.com/Quansight-Labs/intersphinx_registry/pull/129). Using the service from your
 project's CI? Open https://link-check-proxy.carreau.workers.dev in a browser
 for consumer instructions, or
 [request an API key](https://github.com/carreau/link-check-proxy/issues/new?template=api-key.yml).

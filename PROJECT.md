@@ -476,6 +476,11 @@ watcher's "overdue" times for such a host reflect it.
   tier's CPU budget.
 - Client integrations: Sphinx extension, lychee/markdown-link-check
   wrappers, GitHub Action.
+- A small Python client package, extracted from the first real consumer,
+  intersphinx_registry ([#129](https://github.com/Quansight-Labs/intersphinx_registry/pull/129), `tests/linkcheck_proxy.py`). It would
+  cover a one-request `fetch()` with the key → OIDC → public snapshot
+  fallback, `known_ok()`, and the pytest wiring (query once before
+  collection, share the result with xdist workers, summary header).
 - Per-host and per-URL policy tuning, learned from observed flakiness.
 - Optional `wait_ms` on `/v1/check`, to check a small number of unknown URLs
   synchronously.
