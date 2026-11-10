@@ -12,9 +12,18 @@ for consumer instructions, or
 
 ## API
 
-All `/v1/*` endpoints require `Authorization: Bearer <key>`. The root `/` is
-public. Browsers get a page for consumers (from `src/home.ts`); API clients
-get a small JSON blob.
+> **Every URL submitted to the service becomes public.** URLs and their
+> results are stored and published in the hourly snapshot at
+> `/v1/snapshot.json`, which anyone can download without a key. Key holders
+> must only submit URLs that are already public. Never submit private or
+> internal URLs, or URLs that carry tokens, signed parameters or personal
+> data.
+
+All `/v1/*` endpoints require `Authorization: Bearer <credential>`, except
+`/v1/snapshot.json`. The credential is an API key, or a GitHub Actions OIDC
+token from an allowlisted org or repository (see [GitHub OIDC](#github-oidc)).
+The root `/` is public. Browsers get a page for consumers (from
+`src/home.ts`); API clients get a small JSON blob.
 
 ```console
 $ curl -s $LCP_URL/v1/check \
@@ -27,6 +36,22 @@ $ curl -s $LCP_URL/v1/check \
 
 `state` is `fresh`, `stale`, `unknown` or `rejected`. The client decides what
 to do with each. See PROJECT.md §4.
+
+### Public snapshot (no key)
+
+Callers without a key, such as CI on pull requests from forks, can download
+every result at once. Fetching it never adds URLs and never triggers checks.
+
+```console
+$ curl -s $LCP_URL/v1/snapshot.json
+{"format": 1, "generated_at": 1762770000,
+ "fields": ["status", "error", "checked_at", "expires_at", "consecutive_failures"],
+ "urls": {"https://numpy.org/": [200, null, 1762760000, 1762846400, 0], ...}}
+```
+
+It is rebuilt every hour, at minute 0, and served with an `ETag`, so send
+`If-None-Match` to get a `304` when it hasn't changed. Until the first
+rebuild it returns `503`.
 
 ## Deploy
 
@@ -52,13 +77,23 @@ directly. Run every command from the repository root.
    Copy the `database_id` it prints into `wrangler.toml`, replacing the
    `00000000-…` placeholder. Commit that change; the id is not a secret.
 
-3. **Create the tables:**
+3. **Create the KV namespace** for the public snapshot:
+
+   ```console
+   wrangler kv namespace create SNAPSHOT
+   ```
+
+   Put the printed `id` into the `[[kv_namespaces]]` block of
+   `wrangler.toml`, replacing `REPLACE_WITH_KV_NAMESPACE_ID`, and commit it.
+   Keep `binding = "SNAPSHOT"`, whatever binding name the command suggests.
+
+4. **Create the tables:**
 
    ```console
    wrangler d1 migrations apply link-check-proxy --remote
    ```
 
-4. **Deploy the Worker.** This also installs the every-minute cron trigger:
+5. **Deploy the Worker.** This also installs the every-minute cron trigger:
 
    ```console
    wrangler deploy
@@ -68,7 +103,7 @@ directly. Run every command from the repository root.
    If your account has no `workers.dev` subdomain yet, wrangler asks you to
    pick one.
 
-5. **Set the admin token.** Generate a long random string, keep it in your
+6. **Set the admin token.** Generate a long random string, keep it in your
    password manager, and store it as a Worker secret:
 
    ```console
@@ -78,7 +113,7 @@ directly. Run every command from the repository root.
 
    Secrets take effect immediately; no redeploy is needed.
 
-6. **Smoke test:**
+7. **Smoke test:**
 
    ```console
    export LCP_URL=https://link-check-proxy.<your-subdomain>.workers.dev
@@ -111,7 +146,11 @@ wrangler deploy
 ```
 
 Apply migrations **before** deploying, so new code never runs against an
-old schema. For example, `0002_meta.sql` adds the table behind the monitoring
+old schema.
+
+**Upgrading to the snapshot version:** do step 3 of the bootstrap once
+(create the KV namespace and put its id in `wrangler.toml`). `wrangler deploy`
+fails while the placeholder id is still there. For example, `0002_meta.sql` adds the table behind the monitoring
 view. If you deploy without it, each tick still saves its results but then
 fails with `no such table: meta`.
 
@@ -125,6 +164,38 @@ wrangler d1 execute link-check-proxy --remote \
   --command "SELECT status, COUNT(*) FROM urls GROUP BY status"   # ad-hoc queries
 ```
 
+## GitHub OIDC
+
+Projects on GitHub Actions don't need a key. Instead they are added to
+[`config/github-oidc.json`](config/github-oidc.json), which is bundled into
+the Worker. Changes take effect on the next `wrangler deploy`.
+
+```json
+{"name": "Jupyter", "owner": "jupyter", "owner_id": 7388996}
+{"name": "pydata-sphinx-theme", "repository": "pydata/pydata-sphinx-theme", "repository_id": 130237506}
+```
+
+- **Onboarding is a pull request.** The contributor adds an entry with the id
+  set to `null`. The CI job `Check OIDC allowlist` (`tools/check_allowlist.py`)
+  looks the name up on the GitHub API and prints the id to paste in, along
+  with a corrected file. It fails until the ids are right. You can run it
+  locally too: `python3 tools/check_allowlist.py`.
+- **Matching uses numeric ids only.** Names can be renamed, or released and
+  re-registered by someone else; ids can't. If CI reports an id/name
+  mismatch, find out why before changing anything. Never "fix" it by
+  copying the new id over.
+- A repository entry takes precedence over its org's entry, so it can have
+  its own quota.
+- `new_url_quota_per_day` is optional (default 500).
+- **Access by event:** `push`, `schedule`, `workflow_dispatch` and
+  `merge_group` get full access. Every other event, including `pull_request`,
+  is read-only: cached results only, nothing added. Fork PRs can't mint
+  tokens at all and use the public snapshot.
+- To revoke an entry, remove it in a PR and redeploy.
+
+The client side needs `permissions: id-token: write` and a token minted with
+`audience=link-check-proxy`. The consumer page (`/`) has a copy-paste example.
+
 ## Issuing API keys
 
 Projects ask for a key by opening an issue with the "API key request" form
@@ -136,7 +207,7 @@ the issue URL as its `owner`, so every key can be traced back to its request:
 ```console
 $ curl -s $LCP_URL/v1/admin/keys \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
-    -d '{"name": "numpy", "owner": "https://github.com/carreau/link-check-proxy/issues/12", "quota": 5000}'
+    -d '{"name": "numpy", "owner": "https://github.com/carreau/link-check-proxy/issues/12", "quota": 500}'
 {"id": "key_…", "key": "lcp_…", ...}     # the key is shown only once
 
 $ curl -s $LCP_URL/v1/admin/keys -H "Authorization: Bearer $ADMIN_TOKEN"
@@ -145,7 +216,7 @@ $ curl -s -X DELETE $LCP_URL/v1/admin/keys/key_… -H "Authorization: Bearer $AD
 
 For an ongoing view of the service, see [Monitoring](#monitoring).
 
-`quota` is the number of *new* URLs the key may add per day. Looking up URLs
+`quota` is the number of *new* URLs the key may add per day (default 500). Looking up URLs
 that are already known is not limited by it.
 
 ## Monitoring

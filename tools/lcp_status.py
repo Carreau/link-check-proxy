@@ -105,6 +105,12 @@ def render(data: dict, base_url: str, width: int, st: Style) -> str:
     else:
         tick = st._c("33", "no tick recorded yet")
     out.append(f"due now {due}   {tick}")
+    snap = data.get("snapshot")
+    out.append(
+        st.dim(f"public snapshot: {snap['urls']} URLs, {snap['bytes'] / 1e6:.1f} MB, built {rel(snap['generated_at'], now)}")
+        if snap
+        else st.dim("public snapshot: not built yet (hourly, needs the SNAPSHOT KV binding)")
+    )
 
     # Columns: 10 + 2 + 12 + 2 + 9 + 2 + url
     url_w = max(20, width - 37)
@@ -157,8 +163,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     size = shutil.get_terminal_size((100, 40))  # honors COLUMNS/LINES set by `watch`
-    # Header is 3 lines + 2 section titles + 2 blank lines; split the rest.
-    limit = args.limit or max(3, min(100, (size.lines - 9) // 2))
+    # Header is 4 lines + 2 section titles + 2 blank lines; split the rest.
+    limit = args.limit or max(3, min(100, (size.lines - 10) // 2))
 
     try:
         data = fetch(args.url, token, limit)

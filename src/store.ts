@@ -279,7 +279,33 @@ export class Store {
     return r?.n ?? 0;
   }
 
-  /** Full-table counts. Reads every row: call rarely (see refreshStats). */
+  /**
+   * One page of the public snapshot, built inside SQLite: a JSON object
+   * `{url: [status, error, checked_at, expires_at, consecutive_failures]}` for
+   * checked URLs with url > `after`, in primary-key order. Keyset paging keeps
+   * each result value well under D1's 2 MB value limit.
+   */
+  async snapshotPage(
+    after: string,
+    limit: number,
+  ): Promise<{ obj: string; last: string | null; n: number }> {
+    // `last` covers never-checked rows too, so paging always advances.
+    const r = await this.db
+      .prepare(
+        `SELECT json_group_object(url,
+                  json_array(status, error, checked_at, expires_at, consecutive_failures))
+                  FILTER (WHERE checked_at IS NOT NULL) AS obj,
+                COUNT(*) FILTER (WHERE checked_at IS NOT NULL) AS n,
+                MAX(url) AS last
+         FROM (SELECT url, status, error, checked_at, expires_at, consecutive_failures
+               FROM urls WHERE url > ? ORDER BY url LIMIT ?)`,
+      )
+      .bind(after, limit)
+      .first<{ obj: string | null; last: string | null; n: number }>();
+    return { obj: r?.obj ?? "{}", last: r?.last ?? null, n: r?.n ?? 0 };
+  }
+
+  /** Full-table counts. Reads every row: call rarely (hourly maintenance). */
   async stats(now: number): Promise<Record<string, number>> {
     const r = await this.db
       .prepare(

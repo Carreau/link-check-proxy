@@ -38,6 +38,8 @@ export interface Config {
 }
 
 export const REPO_URL = "https://github.com/carreau/link-check-proxy";
+/** New URLs per day for API keys created without an explicit quota. */
+export const DEFAULT_KEY_QUOTA = 500;
 
 const HOUR = 3600;
 const DAY = 24 * HOUR;

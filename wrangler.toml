@@ -11,5 +11,12 @@ database_name = "link-check-proxy"
 database_id = "b7f6f64f-2153-4c76-a1cf-49f7608ab463"
 migrations_dir = "migrations"
 
+# Public snapshot (/v1/snapshot.json), rebuilt hourly. Create once with
+#   wrangler kv namespace create SNAPSHOT
+# and paste the printed id here (the id is not a secret).
+[[kv_namespaces]]
+binding = "SNAPSHOT"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
 # Secrets (set with `npx wrangler secret put ADMIN_TOKEN`):
 #   ADMIN_TOKEN  bootstrap admin credential for /v1/admin/* endpoints

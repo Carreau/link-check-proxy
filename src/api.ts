@@ -1,10 +1,12 @@
 /** HTTP API. Every endpoint requires a valid key; nothing is anonymous. */
 import { bearerToken, generateApiKey, randomToken, sha256Hex, timingSafeEqualHex } from "./auth.js";
-import { REPO_URL, type Config } from "./config.js";
+import { DEFAULT_KEY_QUOTA, REPO_URL, type Config } from "./config.js";
 import { homePage } from "./home.js";
 import { publicResult, rejectedResult } from "./policy.js";
 import type { ApiKeyRow, NewUrl, Store } from "./store.js";
 import type { RecentCheck, TickReport } from "./scheduler.js";
+import { looksLikeJwt, matchAllowlist, type Allowlist, type GithubClaims, type OidcGrant } from "./oidc.js";
+import { snapshotGeneratedAt, type SnapshotInfo } from "./snapshot.js";
 import type { PublicResult } from "./types.js";
 import { normalizeUrl } from "./url.js";
 
@@ -14,9 +16,16 @@ export interface ApiDeps {
   nowMs: () => number;
   /** Bootstrap admin token (Worker secret). Optional. */
   adminToken?: string;
+  /** Returns the current public snapshot body, if any (cached by the caller). */
+  snapshot?: () => Promise<string | null>;
+  /** GitHub Actions OIDC: token verifier + allowlist. Optional. */
+  oidc?: { verify: (token: string) => Promise<GithubClaims | null>; allowlist: Allowlist };
 }
 
-type Caller = { kind: "key"; key: ApiKeyRow; admin: boolean } | { kind: "bootstrap"; admin: true };
+type Caller =
+  | { kind: "key"; key: ApiKeyRow; admin: boolean }
+  | { kind: "bootstrap"; admin: true }
+  | { kind: "oidc"; grant: OidcGrant; admin: false };
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -40,8 +49,14 @@ export async function handleRequest(req: Request, deps: ApiDeps): Promise<Respon
     return json({ service: "link-check-proxy", docs: REPO_URL });
   }
 
+  // Public, read-only, never adds URLs: everything in it is already public.
+  if (path === "/v1/snapshot.json" && (req.method === "GET" || req.method === "HEAD")) {
+    return serveSnapshot(req, deps);
+  }
+
   const caller = await authenticate(req, deps);
-  if (!caller) return err(401, "missing or invalid API key");
+  if (!caller) return err(401, "missing or invalid API key or OIDC token");
+  if ("denied" in caller) return err(403, caller.denied);
 
   try {
     if (path === "/v1/check" && req.method === "POST") return await check(req, caller, deps);
@@ -70,9 +85,27 @@ export async function handleRequest(req: Request, deps: ApiDeps): Promise<Respon
   }
 }
 
-async function authenticate(req: Request, deps: ApiDeps): Promise<Caller | null> {
+async function authenticate(req: Request, deps: ApiDeps): Promise<Caller | { denied: string } | null> {
   const token = bearerToken(req);
   if (!token) return null;
+  if (looksLikeJwt(token)) {
+    if (!deps.oidc) return null;
+    let claims: GithubClaims | null = null;
+    try {
+      claims = await deps.oidc.verify(token);
+    } catch (e) {
+      console.error("OIDC verification error", e);
+      return null;
+    }
+    if (!claims) return null;
+    const grant = matchAllowlist(claims, deps.oidc.allowlist);
+    if (!grant) {
+      return {
+        denied: `${claims.repository} is not in the OIDC allowlist (config/github-oidc.json); open a PR to add it`,
+      };
+    }
+    return { kind: "oidc", grant, admin: false };
+  }
   const hash = await sha256Hex(token);
   if (deps.adminToken && timingSafeEqualHex(hash, await sha256Hex(deps.adminToken))) {
     return { kind: "bootstrap", admin: true };
@@ -112,16 +145,29 @@ async function check(req: Request, caller: Caller, deps: ApiDeps): Promise<Respo
   for (const { url, host } of normalized.values()) unique.set(url, host);
   const known = await store.lookup([...unique.keys()]);
 
+  // Read-only callers (OIDC runs from pull_request etc.) never add URLs.
+  const readOnly = caller.kind === "oidc" && caller.grant.readOnly;
+  const quota =
+    caller.kind === "key"
+      ? { id: caller.key.id, limit: caller.key.new_url_quota_per_day }
+      : caller.kind === "oidc"
+        ? { id: caller.grant.usageId, limit: caller.grant.quota }
+        : null; // bootstrap admin: unlimited
+
   // New URLs, subject to the caller's daily quota.
   let fresh = [...unique.keys()].filter((u) => !known.has(u));
   const overQuota = new Set<string>();
-  if (fresh.length > 0 && caller.kind === "key") {
+  const notQueued = new Set<string>();
+  if (readOnly) {
+    for (const u of fresh) notQueued.add(u);
+    fresh = [];
+  } else if (fresh.length > 0 && quota) {
     const day = new Date(nowMs).toISOString().slice(0, 10);
-    const used = await store.newUrlsUsed(caller.key.id, day);
-    const allowed = Math.max(0, caller.key.new_url_quota_per_day - used);
+    const used = await store.newUrlsUsed(quota.id, day);
+    const allowed = Math.max(0, quota.limit - used);
     for (const u of fresh.slice(allowed)) overQuota.add(u);
     fresh = fresh.slice(0, allowed);
-    await store.addNewUrlsUsed(caller.key.id, day, fresh.length);
+    await store.addNewUrlsUsed(quota.id, day, fresh.length);
   }
   await store.insertNew(spreadNewUrls(fresh, unique, now, cfg.newUrlHostSpacing), now);
 
@@ -131,11 +177,11 @@ async function check(req: Request, caller: Caller, deps: ApiDeps): Promise<Respo
   await store.touch(toTouch, now, cfg.hotRefreshFraction);
 
   for (const [raw, { url }] of normalized) {
-    results[raw] = overQuota.has(url)
-      ? rejectedResult("new_url_quota_exceeded")
-      : publicResult(known.get(url), now);
+    if (overQuota.has(url)) results[raw] = rejectedResult("new_url_quota_exceeded");
+    else if (notQueued.has(url)) results[raw] = { ...publicResult(undefined, now), reason: "read_only_not_queued" };
+    else results[raw] = publicResult(known.get(url), now);
   }
-  return json({ results });
+  return json({ mode: readOnly ? "read_only" : "full", results });
 }
 
 /**
@@ -177,6 +223,20 @@ async function single(url: URL, deps: ApiDeps): Promise<Response> {
   });
 }
 
+async function serveSnapshot(req: Request, deps: ApiDeps): Promise<Response> {
+  const body = deps.snapshot ? await deps.snapshot() : null;
+  if (body === null) return err(503, "snapshot not generated yet; it is rebuilt hourly");
+  const etag = `"snap-${snapshotGeneratedAt(body) ?? body.length}"`;
+  const headers = {
+    "content-type": "application/json",
+    "cache-control": "public, max-age=300",
+    etag,
+    "access-control-allow-origin": "*",
+  };
+  if (req.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers });
+  return new Response(req.method === "HEAD" ? null : body, { headers });
+}
+
 const DUE_COUNT_CAP = 1000;
 
 /**
@@ -187,17 +247,19 @@ async function overview(url: URL, deps: ApiDeps): Promise<Response> {
   const { store } = deps;
   const now = Math.floor(deps.nowMs() / 1000);
   const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 20, 1), 100);
-  const [stats, lastTick, recent, upcoming, due] = await Promise.all([
+  const [stats, lastTick, recent, upcoming, due, snapshot] = await Promise.all([
     store.getMeta<Record<string, number>>("stats"),
     store.getMeta<TickReport>("last_tick"),
     store.getMeta<RecentCheck[]>("recent"),
     store.upcoming(limit),
     store.dueCount(now, DUE_COUNT_CAP),
+    store.getMeta<SnapshotInfo>("snapshot"),
   ]);
   return json({
     now,
     stats: stats ? { ...stats.value, computed_at: stats.updated_at } : null,
     last_tick: lastTick ? { ...lastTick.value, at: lastTick.updated_at } : null,
+    snapshot: snapshot?.value ?? null,
     due_now: due,
     due_capped: due >= DUE_COUNT_CAP,
     upcoming: upcoming.map((r) => ({
@@ -221,7 +283,7 @@ async function createKey(req: Request, deps: ApiDeps): Promise<Response> {
     return err(400, "body must be JSON");
   }
   if (typeof body.name !== "string" || body.name.trim() === "") return err(400, "name is required");
-  const quota = body.quota === undefined ? 5000 : Number(body.quota);
+  const quota = body.quota === undefined ? DEFAULT_KEY_QUOTA : Number(body.quota);
   if (!Number.isInteger(quota) || quota < 0) return err(400, "quota must be a non-negative integer");
 
   const key = generateApiKey();

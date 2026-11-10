@@ -6,8 +6,13 @@ body:
   - type: markdown
     attributes:
       value: |
+        **On GitHub Actions? You don't need a key.** Open a pull request adding your org or
+        repository to `config/github-oidc.json` instead (leave the id `null`; CI prints it).
+
         Keys are issued by hand to projects in the Jupyter / Scientific Python ecosystem.
         The key will be sent to you **privately**. Never paste a key into an issue, commit or CI log.
+
+        **Every URL you submit becomes public.** It is stored and published in the hourly snapshot at `/v1/snapshot.json`.
   - type: input
     id: project
     attributes:
@@ -48,6 +53,14 @@ body:
         - Other
     validations:
       required: true
+  - type: checkboxes
+    id: public
+    attributes:
+      label: Submitted URLs are public
+      description: Every URL sent to the service is stored and published in the public snapshot (/v1/snapshot.json).
+      options:
+        - label: I understand that every URL we submit becomes public, and we will only submit URLs that are already public (no private or internal URLs, no URLs containing tokens or personal data).
+          required: true
   - type: textarea
     id: notes
     attributes:

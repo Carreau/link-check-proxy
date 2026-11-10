@@ -3,8 +3,10 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { handleRequest } from "../src/api.js";
 import type { FetchFn } from "../src/checker.js";
 import { DEFAULT_CONFIG, type Config } from "../src/config.js";
-import { runTick } from "../src/scheduler.js";
+import { runMaintenance, runTick } from "../src/scheduler.js";
+import { buildSnapshot, type BlobStore } from "../src/snapshot.js";
 import { Store } from "../src/store.js";
+import { normalizeUrl } from "../src/url.js";
 import { createTestDb } from "./sqlite-d1.js";
 
 const ADMIN = "admin-secret";
@@ -184,7 +186,7 @@ describe("scheduler", () => {
 
     // 31 days without requests: dropped.
     clock += 31 * DAY_MS;
-    const r = await tick(okFetch(), { dropIdle: true });
+    const r = await runMaintenance({ store, cfg, nowMs: clock, dropIdle: true });
     expect(r.dropped).toBe(1);
     expect((await store.lookup(["https://a.org/"])).size).toBe(0);
   });
@@ -247,5 +249,72 @@ describe("root page", () => {
     const api = await call("GET", "/");
     expect(api.headers.get("content-type")).toContain("application/json");
     expect(await api.json()).toMatchObject({ service: "link-check-proxy" });
+  });
+});
+
+describe("public snapshot", () => {
+  const memBlobs = (): BlobStore & { map: Map<string, string> } => {
+    const map = new Map<string, string>();
+    return { map, get: async (k) => map.get(k) ?? null, put: async (k, v) => void map.set(k, v) };
+  };
+  const callWith = (blobs: BlobStore, init: RequestInit = {}) =>
+    handleRequest(new Request("https://proxy.test/v1/snapshot.json", init), {
+      store,
+      cfg,
+      nowMs: () => clock,
+      snapshot: () => blobs.get("snapshot.json"),
+    });
+
+  it("pages through all checked URLs, skipping unknown ones", async () => {
+    const key = await newKey();
+    cfg.newUrlHostSpacing = 0;
+    cfg.maxPerHostPerTick = 100;
+    const urls = Array.from({ length: 7 }, (_, i) => `https://h${i}.org/"quoted"\\path`);
+    await check(key, urls);
+    await tick(async (u) => new Response(null, { status: u.startsWith("https://h2.org/") ? 404 : 200 }));
+    await check(key, ["https://never-checked.org/"]);
+
+    const { body, info } = await buildSnapshot(store, 123, 3); // 3 rows per page
+    const snap = JSON.parse(body);
+    expect(info.urls).toBe(7);
+    expect(snap).toMatchObject({ format: 1, generated_at: 123 });
+    expect(snap.fields).toEqual(["status", "error", "checked_at", "expires_at", "consecutive_failures"]);
+    const normalized = urls.map((u) => (normalizeUrl(u, 2048) as { url: string }).url);
+    expect(Object.keys(snap.urls).sort()).toEqual([...normalized].sort());
+    expect(snap.urls[normalized[2]!][0]).toBe(404);
+    expect(snap.urls["https://never-checked.org/"]).toBeUndefined();
+  });
+
+  it("is empty but valid with no checked URLs", async () => {
+    const { body, info } = await buildSnapshot(store, 1);
+    expect(JSON.parse(body).urls).toEqual({});
+    expect(info.urls).toBe(0);
+  });
+
+  it("is served without a key, supports ETag, and never adds URLs", async () => {
+    const blobs = memBlobs();
+    expect((await callWith(blobs)).status).toBe(503);
+
+    const key = await newKey();
+    await check(key, ["https://a.org/"]);
+    await tick(okFetch());
+    const m = await runMaintenance({ store, cfg, nowMs: clock, blobs });
+    expect(m.snapshot).toMatchObject({ urls: 1 });
+
+    const res = await callWith(blobs);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+    const etag = res.headers.get("etag")!;
+    expect(etag).toBe(`"snap-${Math.floor(clock / 1000)}"`);
+    expect((await res.json()).urls["https://a.org/"][0]).toBe(200);
+
+    expect((await callWith(blobs, { headers: { "if-none-match": etag } })).status).toBe(304);
+
+    // The snapshot route takes no input and other routes still need a key.
+    expect((await call("POST", "/v1/check", undefined, { urls: ["https://new.org/"] })).status).toBe(401);
+    expect((await store.lookup(["https://new.org/"])).size).toBe(0);
+
+    const ov = (await (await call("GET", "/v1/admin/overview", ADMIN)).json()) as any;
+    expect(ov.snapshot).toMatchObject({ urls: 1, generated_at: Math.floor(clock / 1000) });
   });
 });

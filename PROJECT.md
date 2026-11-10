@@ -1,6 +1,6 @@
 # link-check-proxy — Design Document
 
-Status: **v0.4**, deployed; monitoring CLI added (2026-11-10)
+Status: **v0.6**, public snapshot + GitHub OIDC (2026-11-10)
 
 Audience: a small, community-run service for Jupyter and Scientific Python
 projects (NumPy, SciPy, …). Keep it simple; scale later.
@@ -44,6 +44,10 @@ actually being asked about.
                         (global budget + per-host limits)   (outbound fetch)
 ```
 
+An hourly **maintenance** run (minute 0, in place of a checking tick)
+recomputes stats and writes the **public snapshot** to Workers KV. It is
+served at `/v1/snapshot.json`.
+
 Three logical components, which can be deployed together:
 
 1. **API**: authenticates, normalizes URLs, returns what the cache knows,
@@ -81,7 +85,36 @@ limits by orders of magnitude without design changes.
 
 ## 4. API
 
-All endpoints are versioned under `/v1`. Auth: `Authorization: Bearer <key>`.
+All endpoints are versioned under `/v1`. Auth: `Authorization: Bearer <credential>`,
+where the credential is an API key or a GitHub OIDC token (§4.1).
+
+### 4.1 Authentication
+
+- **API keys**, issued by an admin, each with a daily new-URL quota (default
+  500).
+- **GitHub Actions OIDC tokens** (`src/oidc.ts`). No secret is distributed:
+  - Verification: RS256 signature against GitHub's JWKS (cached per isolate
+    for an hour, and refetched at most once a minute when an unknown `kid`
+    shows up), `iss = https://token.actions.githubusercontent.com`,
+    `aud = link-check-proxy`, `exp`/`nbf` with 60 s leeway.
+  - Authorization: the token's `repository_id` or `repository_owner_id`
+    must match an entry in `config/github-oidc.json`, which is bundled at
+    deploy. Matching is by numeric id only: names can be renamed or
+    re-registered, ids can't. A repo entry beats its org's entry. Each entry
+    has its own daily new-URL quota (default 500), tracked in `api_key_usage`
+    under `oidc:<name>`.
+  - Access by `event_name`: `push`, `schedule`, `workflow_dispatch` and
+    `merge_group` get full access. Everything else, including
+    `pull_request`, is **read-only**: known URLs are answered (and touched),
+    unknown URLs come back as `unknown` with
+    `"reason": "read_only_not_queued"` and are not added. The response has
+    `"mode": "read_only"`.
+  - A valid token from a repo not on the allowlist gets `403` with a hint to
+    open a PR. Invalid tokens get `401`. OIDC callers are never admins.
+  - Fork PRs can't mint tokens, so they use the public snapshot.
+  - Onboarding is a PR to the allowlist. CI (`tools/check_allowlist.py`)
+    checks every id against the GitHub API and prints the right value for
+    entries left `null`.
 
 ### `GET /` (public)
 
@@ -92,6 +125,31 @@ issue form, how to read the results, and gives a GitHub Actions example.
 Otherwise it returns `{"service": "link-check-proxy", "docs": <repo URL>}`.
 The outbound User-Agent links to the repository, so site operators can find
 out who is checking their URLs.
+
+### `GET /v1/snapshot.json` (public)
+
+The second endpoint that needs no key. It returns every **checked** URL with
+its last result, as one JSON document rebuilt hourly:
+
+```json
+{"format": 1, "generated_at": 1762770000,
+ "fields": ["status", "error", "checked_at", "expires_at", "consecutive_failures"],
+ "urls": {"https://numpy.org/": [200, null, 1762760000, 1762846400, 0]}}
+```
+
+- Purpose: callers without credentials (fork PRs, local runs, anyone) can use
+  the cache read-only. The route takes no input, so it can never add URLs or
+  cause outbound fetches, consistent with "no key, no checks".
+- Built inside SQLite with `json_group_object`, in keyset pages of 2000
+  rows, so each value stays under D1's 2 MB limit. The Worker only joins
+  strings, which matters because CPU time is tight on the free tier. At 20k
+  URLs it is about 2.2 MB of JSON, which Cloudflare compresses on the way out.
+- Stored in KV (`SNAPSHOT` binding), because a value can be up to 25 MB and
+  there is 1 write per hour. Each isolate keeps it in memory for 5 minutes,
+  since the Cache API is not available on `workers.dev`. That keeps KV reads
+  low. Responses carry `ETag: "snap-<generated_at>"` and support
+  `If-None-Match` → `304`.
+- `503` until the first maintenance run has built it.
 
 ### `POST /v1/check`
 
@@ -302,9 +360,20 @@ pending URLs are pushed past it.
 - Per-key **new-URL quota per day**. It limits how far the service can be
   used to amplify traffic toward arbitrary targets. Lookups of URLs that are
   already known are cheap and limited only by the request rate.
-- The cache is shared across all keys. Results are public information about
-  public URLs.
+- **All submitted URLs are public.** The cache is shared across all keys,
+  and every stored URL and its result is published in `/v1/snapshot.json`.
+  This is stated on the consumer page, in the API-key issue form (a required
+  acknowledgement), and in the README. Key holders must only submit URLs
+  that are already public: no private or internal URLs, and no URLs that
+  embed tokens, signed parameters or personal data. The service can't detect
+  secrets in URLs, so this rests on policy. If something sensitive does get
+  submitted, delete the row
+  (`wrangler d1 execute … "DELETE FROM urls WHERE url = …"`); the next hourly
+  snapshot drops it. Consider revoking the key that submitted it.
 - Keys are stored as hashes, can be revoked, and are issued by an admin.
+- OIDC trusts GitHub's signature plus our allowlist (by numeric id). The
+  `id-token: write` permission lets a job mint tokens for *any* audience, so
+  consumers should grant it only to the jobs that need it.
 
 ## 8. Deployment & operations
 
@@ -313,11 +382,15 @@ pending URLs are pushed past it.
   (cron `* * * * *`).
 - The admin credential is the `ADMIN_TOKEN` Worker secret. Keys created with
   `"admin": true` are admins too.
-- URLs that have not been requested for 30 days are dropped once a day, by
-  the tick at 03:00 UTC.
-- Every tick logs one `tick {...}` line (`wrangler tail`). It also stores its
-  report and adds to the recent-checks log in `meta`. The tick at minute 0 of
-  each hour recomputes the full counts.
+- Minute 0 of every hour runs **maintenance** instead of a checking tick. It
+  recomputes the full counts and rebuilds the public snapshot. At 03:00 UTC
+  it also drops URLs that have not been requested for 30 days. Keeping these
+  full-table scans out of checking ticks keeps the per-invocation query
+  budget for checks. Logs a `maintenance {...}` line.
+- Every other minute, the tick logs one `tick {...}` line (`wrangler tail`),
+  stores its report, and adds to the recent-checks log in `meta`.
+- Bindings: `DB` (D1), `SNAPSHOT` (KV, optional in code; without it no
+  snapshot is built and the endpoint returns `503`).
 - Monitoring: `tools/lcp_status.py`, run under `watch`, shows the counts, the
   queue head and recent checks, from `/v1/admin/overview`. It flags a stalled
   cron when the last tick is more than 3 minutes old.
@@ -352,13 +425,10 @@ pending URLs are pushed past it.
 - Client integrations: Sphinx extension, lychee/markdown-link-check
   wrappers, GitHub Action.
 - Per-host and per-URL policy tuning, learned from observed flakiness.
-- GitHub OIDC auth, so no secret has to be distributed.
-- A published static status page listing every cached URL and its state.
-  Regenerated periodically, it would let anyone (including fork PRs) read
-  results without a key and without triggering any check.
 - Optional `wait_ms` on `/v1/check`, to check a small number of unknown URLs
   synchronously.
-- Stats on that page: most-linked dead URLs, per-host health.
+- A human-readable status page built from the snapshot: most-linked dead
+  URLs, per-host health.
 
 ## 11. Decisions
 
@@ -366,9 +436,16 @@ pending URLs are pushed past it.
   Scientific Python ecosystem (NumPy, SciPy, …). Keep it small and scale
   later. The free tier is expected to be enough.
 - **API keys:** created by hand by an admin and given to projects directly.
-  No self-serve signup.
+  No self-serve signup. Default quota is 500 new URLs/day.
+- **GitHub OIDC:** an allowlist of orgs and repos in `config/github-oidc.json`,
+  managed through PRs and deployed with the code. The initial entries are the
+  jupyter and ipython orgs, plus pydata/pydata-sphinx-theme and
+  Quansight-Labs/intersphinx_registry. `pull_request` runs are read-only.
 - **No anonymous access:** every request without a valid key is refused
-  with `401`. Unauthenticated callers can never cause an outbound check.
+  with `401`. Unauthenticated callers can never cause an outbound check. The
+  only exceptions are the two read-only public routes, `/` and
+  `/v1/snapshot.json`.
+- **Submitted URLs are public:** see §7.
 - **License:** MIT.
 - **Hosting:** the default `*.workers.dev` URL for now. The name and domain
   can be decided later.

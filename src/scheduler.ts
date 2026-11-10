@@ -2,6 +2,7 @@
 import { Budget, checkUrl, mapLimit, type FetchFn } from "./checker.js";
 import type { Config } from "./config.js";
 import { applyResult, pickBatch, type Rand, type ResultUpdate } from "./policy.js";
+import { buildSnapshot, SNAPSHOT_KEY, type BlobStore, type SnapshotInfo } from "./snapshot.js";
 import type { Store } from "./store.js";
 
 export interface TickReport {
@@ -9,7 +10,6 @@ export interface TickReport {
   results: number;
   rateLimited: number;
   deferred: number;
-  dropped: number;
 }
 
 export async function runTick(opts: {
@@ -18,10 +18,6 @@ export async function runTick(opts: {
   cfg: Config;
   nowMs: number;
   rand?: Rand;
-  /** Also delete URLs nobody asked for in `dropAfter` (do this ~daily). */
-  dropIdle?: boolean;
-  /** Recompute full-table stats (a table scan; do this ~hourly). */
-  refreshStats?: boolean;
 }): Promise<TickReport> {
   const { store, fetchFn, cfg } = opts;
   const rand = opts.rand ?? Math.random;
@@ -69,17 +65,48 @@ export async function runTick(opts: {
   await store.applyResults(updates);
   await store.backoffHosts([...backoffs].map(([host, until]) => ({ host, until })));
 
-  const dropped = opts.dropIdle ? await store.dropIdle(now - cfg.dropAfter) : 0;
-
   const report: TickReport = {
     picked: picked.length,
     results: updates.length,
     rateLimited: backoffs.size,
     deferred,
-    dropped,
   };
-  await recordActivity(store, now, report, activity, opts.refreshStats ?? false);
+  await recordActivity(store, now, report, activity);
   return report;
+}
+
+export interface MaintenanceReport {
+  dropped: number;
+  stats: Record<string, number>;
+  snapshot: SnapshotInfo | null;
+}
+
+/**
+ * Hourly housekeeping, run *instead of* a checking tick so its full-table
+ * scans don't compete with checks for the per-invocation query budget:
+ * drop idle URLs (when asked, ~daily), recompute stats, rebuild the public
+ * snapshot.
+ */
+export async function runMaintenance(opts: {
+  store: Store;
+  cfg: Config;
+  nowMs: number;
+  blobs?: BlobStore;
+  dropIdle?: boolean;
+}): Promise<MaintenanceReport> {
+  const { store, cfg } = opts;
+  const now = Math.floor(opts.nowMs / 1000);
+  const dropped = opts.dropIdle ? await store.dropIdle(now - cfg.dropAfter) : 0;
+  const stats = await store.stats(now);
+  await store.setMeta("stats", stats, now);
+  let snapshot: SnapshotInfo | null = null;
+  if (opts.blobs) {
+    const built = await buildSnapshot(store, now);
+    await opts.blobs.put(SNAPSHOT_KEY, built.body);
+    await store.setMeta("snapshot", built.info, now);
+    snapshot = built.info;
+  }
+  return { dropped, stats, snapshot };
 }
 
 /** One entry of the recent-checks log kept in `meta` for the admin overview. */
@@ -99,14 +126,14 @@ async function recordActivity(
   now: number,
   report: TickReport,
   activity: RecentCheck[],
-  refreshStats: boolean,
 ): Promise<void> {
   await store.setMeta("last_tick", report, now);
   if (activity.length > 0) {
     const prev = (await store.getMeta<RecentCheck[]>("recent"))?.value ?? [];
     await store.setMeta("recent", [...activity, ...prev].slice(0, RECENT_LOG_SIZE), now);
   }
-  if (refreshStats || !(await store.getMeta("stats"))) {
+  // Until the first hourly maintenance run, give the overview some numbers.
+  if (!(await store.getMeta("stats"))) {
     await store.setMeta("stats", await store.stats(now), now);
   }
 }

@@ -1,0 +1,25 @@
+{
+  "$comment": "GitHub Actions OIDC allowlist. Each entry is either an org (owner + owner_id) or a single repository (repository + repository_id). Matching uses the numeric ids, which never change and cannot be re-registered; names are for humans. When adding an entry, set the id to null: CI (tools/check_allowlist.py) prints the right value. Optional: new_url_quota_per_day (default 500). See README 'GitHub OIDC'.",
+  "entries": [
+    {
+      "name": "Jupyter",
+      "owner": "jupyter",
+      "owner_id": 7388996
+    },
+    {
+      "name": "IPython",
+      "owner": "ipython",
+      "owner_id": 230453
+    },
+    {
+      "name": "pydata-sphinx-theme",
+      "repository": "pydata/pydata-sphinx-theme",
+      "repository_id": 130237506
+    },
+    {
+      "name": "intersphinx_registry",
+      "repository": "Quansight-Labs/intersphinx_registry",
+      "repository_id": 795438290
+    }
+  ]
+}
