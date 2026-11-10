@@ -232,12 +232,16 @@ watch -n 30 -c tools/lcp_status.py --color
 ```
 link-check-proxy  https://link-check-proxy.carreau.workers.dev  2026-11-10 10:15:33Z
 URLs 1342  fresh 1080  stale 48  unknown 214  failing 12  4xx 31  (counts 21m ago)
-due now 214   last tick 34s ago: picked 20, ok 18, rate-limited 1, deferred 1
+queue: 230 never checked (180 due now), 34 due for refresh; draining takes ≥11m at ≤20/min
+last tick 34s ago: picked 20, ok 18, rate-limited 1, deferred 1
 
-UPCOMING  next check  last checked  status     url
+UPCOMING
+  next check  last checked  status     url
   due 5m      never         -          https://github.com/jupyter/notebook/issues/123
   in 45s      15m ago       503        https://docs.scipy.org/doc/scipy/reference/…
-RECENT    checked     next check    status     url
+
+RECENT
+  checked     next check    status     url
   34s ago     in 6h00       404        https://example.org/gone
   1m ago      in 15m        dns        https://nope.invalid/
 ```

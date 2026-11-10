@@ -218,12 +218,18 @@ check history summary (next scheduled check, idle level).
 - `GET /v1/admin/overview?limit=N`: cheap, safe to poll. It returns:
   - the cached full counts (recomputed hourly by the cron job),
   - the last tick's report,
-  - the number of due URLs (counted up to 1000),
-  - the next N URLs in schedule order,
+  - queue sizes, each counted through an index and capped at 1000: URLs due
+    now, never-checked URLs (total, and how many are due), and
+    already-checked URLs due for refresh. Also `checks_per_tick`, so clients
+    can estimate how long the backlog takes to drain,
+  - the next N URLs in the scheduler's priority order: never-checked due URLs
+    first, then by `next_check_at`. Per-host limits and backoffs can still
+    reorder individual picks,
+  - the public snapshot's size and age,
   - the last N checks (a log of the most recent 100, kept in the `meta`
     table).
 
-  `tools/lcp_status.py` renders it for `watch`.
+  `tools/lcp_status.py` renders it, refreshed in a loop (see README).
 - `GET /v1/admin/stats`: live URL counts by state. It scans the whole table,
   so don't poll it.
 

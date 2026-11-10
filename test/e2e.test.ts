@@ -215,6 +215,7 @@ describe("admin overview", () => {
     expect(b.stats).toBeNull();
     expect(b.last_tick).toBeNull();
     expect(b.due_now).toBe(3);
+    expect(b.queue).toMatchObject({ never_checked: 3, never_checked_due: 3, refresh_due: 0, checks_per_tick: 20 });
     expect(b.upcoming.map((u: any) => u.state)).toEqual(["unknown", "unknown", "unknown"]);
 
     await tick(okFetch({ "https://b.org/x": 404 }));
@@ -224,6 +225,7 @@ describe("admin overview", () => {
     expect(after.stats).toMatchObject({ urls: 3, fresh: 3, unknown: 0 });
     expect(after.last_tick).toMatchObject({ picked: 3, results: 3 });
     expect(after.due_now).toBe(0);
+    expect(after.queue).toMatchObject({ never_checked: 0, never_checked_due: 0, refresh_due: 0 });
     expect(after.recent).toHaveLength(3);
     expect(after.recent.find((r: any) => r.url === "https://b.org/x")).toMatchObject({ status: 404, kind: "result" });
     // 4xx has the shortest TTL, so it is next in line.
@@ -316,5 +318,19 @@ describe("public snapshot", () => {
 
     const ov = (await (await call("GET", "/v1/admin/overview", ADMIN)).json()) as any;
     expect(ov.snapshot).toMatchObject({ urls: 1, generated_at: Math.floor(clock / 1000) });
+  });
+});
+
+describe("overview ordering", () => {
+  it("lists never-checked due URLs before due refreshes, like the scheduler", async () => {
+    const key = await newKey();
+    cfg.newUrlHostSpacing = 0;
+    await check(key, ["https://old.org/"]);
+    await tick(okFetch());
+    clock += 2 * DAY_MS; // old.org is now due for refresh, and overdue by more
+    await check(key, ["https://new.org/"]);
+    const ov = (await (await call("GET", "/v1/admin/overview", ADMIN)).json()) as any;
+    expect(ov.upcoming.map((u: any) => u.url)).toEqual(["https://new.org/", "https://old.org/"]);
+    expect(ov.queue).toMatchObject({ never_checked: 1, never_checked_due: 1, refresh_due: 1 });
   });
 });

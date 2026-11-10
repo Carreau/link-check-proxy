@@ -28,7 +28,7 @@ def rel(ts: int | None, now: int) -> str:
         return "never"
     d = ts - now
     a = abs(d)
-    if a < 60:
+    if a < 100:
         s = f"{a}s"
     elif a < 3600:
         s = f"{a // 60}m"
@@ -70,6 +70,28 @@ class Style:
         return self._c("32", text)
 
 
+def queue_line(data: dict) -> str:
+    """Queue sizes and a rough time to drain what is due right now."""
+    q = data.get("queue")
+    due = data["due_now"]
+    if not q:  # older server
+        return f"due now {due}{'+' if data.get('due_capped') else ''}"
+    cap = q["count_cap"]
+
+    def n(v: int) -> str:
+        return f"{v}+" if v >= cap else str(v)
+
+    line = (
+        f"queue: {n(q['never_checked'])} never checked "
+        f"({n(q['never_checked_due'])} due now), {n(q['refresh_due'])} due for refresh"
+    )
+    if due:
+        # Lower bound: per-host limits (1 URL/host/min) can make it slower.
+        minutes = -(-due // max(1, q["checks_per_tick"]))
+        line += f"; draining takes ≥{minutes}m at ≤{q['checks_per_tick']}/min"
+    return line
+
+
 def fit(url: str, width: int) -> str:
     if width <= 1 or len(url) <= width:
         return url
@@ -93,7 +115,7 @@ def render(data: dict, base_url: str, width: int, st: Style) -> str:
     else:
         out.append(st.dim("no cached stats yet (computed by the cron tick)"))
 
-    due = f"{data['due_now']}{'+' if data.get('due_capped') else ''}"
+    out.append(queue_line(data))
     t = data.get("last_tick")
     if t:
         tick = (
@@ -104,7 +126,7 @@ def render(data: dict, base_url: str, width: int, st: Style) -> str:
             tick = st._c("31", tick + "  ← cron stalled?")
     else:
         tick = st._c("33", "no tick recorded yet")
-    out.append(f"due now {due}   {tick}")
+    out.append(tick)
     snap = data.get("snapshot")
     out.append(
         st.dim(f"public snapshot: {snap['urls']} URLs, {snap['bytes'] / 1e6:.1f} MB, built {rel(snap['generated_at'], now)}")
@@ -116,7 +138,9 @@ def render(data: dict, base_url: str, width: int, st: Style) -> str:
     url_w = max(20, width - 37)
 
     out.append("")
-    out.append(st.bold("UPCOMING") + st.dim("  next check  last checked  status     url"))
+    # Column headings use the same widths as the rows below them.
+    out.append(st.bold("UPCOMING"))
+    out.append(st.dim(f"  {'next check':<10}  {'last checked':<12}  {'status':<9}  url"))
     for r in data.get("upcoming", []):
         nxt = r["next_check_at"]
         when = "due " + rel(nxt, now).replace(" ago", "") if nxt <= now else rel(nxt, now)
@@ -129,7 +153,8 @@ def render(data: dict, base_url: str, width: int, st: Style) -> str:
         out.append(st.dim("  (no URLs)"))
 
     out.append("")
-    out.append(st.bold("RECENT") + st.dim("    checked     next check    status     url"))
+    out.append(st.bold("RECENT"))
+    out.append(st.dim(f"  {'checked':<10}  {'next check':<12}  {'status':<9}  url"))
     for r in data.get("recent", []):
         out.append(
             f"  {rel(r['at'], now)[:10]:<10}  {(rel(r['next_check_at'], now) if r['next_check_at'] else '-')[:12]:<12}  "
@@ -163,8 +188,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     size = shutil.get_terminal_size((100, 40))  # honors COLUMNS/LINES set by `watch`
-    # Header is 4 lines + 2 section titles + 2 blank lines; split the rest.
-    limit = args.limit or max(3, min(100, (size.lines - 10) // 2))
+    # Header is 5 lines + 2x(title + headings) + 2 blank lines; split the rest.
+    limit = args.limit or max(3, min(100, (size.lines - 13) // 2))
 
     try:
         data = fetch(args.url, token, limit)

@@ -251,8 +251,8 @@ async function overview(url: URL, deps: ApiDeps): Promise<Response> {
     store.getMeta<Record<string, number>>("stats"),
     store.getMeta<TickReport>("last_tick"),
     store.getMeta<RecentCheck[]>("recent"),
-    store.upcoming(limit),
-    store.dueCount(now, DUE_COUNT_CAP),
+    store.upcoming(now, limit),
+    store.queueCounts(now, DUE_COUNT_CAP),
     store.getMeta<SnapshotInfo>("snapshot"),
   ]);
   return json({
@@ -260,8 +260,16 @@ async function overview(url: URL, deps: ApiDeps): Promise<Response> {
     stats: stats ? { ...stats.value, computed_at: stats.updated_at } : null,
     last_tick: lastTick ? { ...lastTick.value, at: lastTick.updated_at } : null,
     snapshot: snapshot?.value ?? null,
-    due_now: due,
-    due_capped: due >= DUE_COUNT_CAP,
+    due_now: due.due,
+    due_capped: due.due >= DUE_COUNT_CAP,
+    queue: {
+      // All counts are capped at count_cap (reported as "≥ cap").
+      count_cap: DUE_COUNT_CAP,
+      never_checked: due.unknown,
+      never_checked_due: due.unknown_due,
+      refresh_due: Math.max(0, due.due - due.unknown_due),
+      checks_per_tick: deps.cfg.checksPerTick,
+    },
     upcoming: upcoming.map((r) => ({
       url: r.url,
       state: publicResult(r, now).state,

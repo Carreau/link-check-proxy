@@ -262,21 +262,50 @@ export class Store {
   // ---- Stats ----
 
   /** Next URLs in schedule order. Index range scan: reads `limit` rows. */
-  async upcoming(limit: number): Promise<UrlRow[]> {
-    const { results } = await this.db
-      .prepare(`SELECT ${URL_COLS} FROM urls ORDER BY next_check_at LIMIT ?`)
-      .bind(limit)
-      .all<UrlRow>();
-    return results;
+  /**
+   * The next `limit` URLs in the scheduler's priority order: never-checked
+   * due URLs first, then everything by next_check_at (per-host limits and
+   * backoffs aside). Two index scans, each reading at most `limit` rows.
+   */
+  async upcoming(now: number, limit: number): Promise<UrlRow[]> {
+    const [unknown, rest] = await this.db.batch([
+      this.db
+        .prepare(
+          `SELECT ${URL_COLS} FROM urls WHERE checked_at IS NULL AND next_check_at <= ?
+           ORDER BY next_check_at LIMIT ?`,
+        )
+        .bind(now, limit),
+      this.db.prepare(`SELECT ${URL_COLS} FROM urls ORDER BY next_check_at LIMIT ?`).bind(limit),
+    ]);
+    const seen = new Set<string>();
+    const out: UrlRow[] = [];
+    for (const r of [
+      ...((unknown as { results: UrlRow[] }).results ?? []),
+      ...((rest as { results: UrlRow[] }).results ?? []),
+    ]) {
+      if (out.length >= limit) break;
+      if (seen.has(r.url)) continue;
+      seen.add(r.url);
+      out.push(r);
+    }
+    return out;
   }
 
-  /** Number of due URLs, counting at most `cap` rows. */
-  async dueCount(now: number, cap: number): Promise<number> {
+  /**
+   * Queue sizes for the overview, each counting at most `cap` rows via an
+   * index: due now (any), never checked (total), never checked and due.
+   */
+  async queueCounts(now: number, cap: number): Promise<{ due: number; unknown: number; unknown_due: number }> {
     const r = await this.db
-      .prepare(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM urls WHERE next_check_at <= ? LIMIT ?)`)
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM (SELECT 1 FROM urls WHERE next_check_at <= ?1 LIMIT ?2)) AS due,
+           (SELECT COUNT(*) FROM (SELECT 1 FROM urls WHERE checked_at IS NULL LIMIT ?2)) AS unknown,
+           (SELECT COUNT(*) FROM (SELECT 1 FROM urls WHERE checked_at IS NULL AND next_check_at <= ?1 LIMIT ?2)) AS unknown_due`,
+      )
       .bind(now, cap)
-      .first<{ n: number }>();
-    return r?.n ?? 0;
+      .first<{ due: number; unknown: number; unknown_due: number }>();
+    return { due: r?.due ?? 0, unknown: r?.unknown ?? 0, unknown_due: r?.unknown_due ?? 0 };
   }
 
   /**
