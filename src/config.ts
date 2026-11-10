@@ -37,6 +37,8 @@ export interface Config {
   jitter: number;
 }
 
+export const REPO_URL = "https://github.com/carreau/link-check-proxy";
+
 const HOUR = 3600;
 const DAY = 24 * HOUR;
 
@@ -55,8 +57,7 @@ export const DEFAULT_CONFIG: Config = {
   maxRedirects: 10,
   defaultRetryAfter: HOUR,
   maxRetryAfter: DAY,
-  userAgent:
-    "link-check-proxy/0.1 (+https://github.com/; shared link-check cache for Jupyter/Scientific Python CI)",
+  userAgent: `link-check-proxy/0.1 (+${REPO_URL}; shared link-check cache for Jupyter/Scientific Python CI)`,
 
   ttlOk: DAY,
   ttlRedirect: DAY,

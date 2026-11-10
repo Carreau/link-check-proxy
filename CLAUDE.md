@@ -14,6 +14,9 @@ background.
   operator scripts (Python, stdlib only).
 - Deployed at https://link-check-proxy.carreau.workers.dev. The maintainer
   deploys with their own `wrangler`, outside this VM.
+- `src/home.ts` is the public consumer page served at `/`. Keep it in sync
+  with the API, the result states and the TTLs. Keys are requested through
+  `.github/ISSUE_TEMPLATE/api-key.yml` and are never posted in issues.
 - Never poll full-table queries. D1 free-tier read and write budgets shape
   the design (see PROJECT.md §5 and §6.5).
 - Target: Cloudflare Workers + D1 + Cron Triggers, TypeScript.

@@ -1,6 +1,7 @@
 /** HTTP API. Every endpoint requires a valid key; nothing is anonymous. */
 import { bearerToken, generateApiKey, randomToken, sha256Hex, timingSafeEqualHex } from "./auth.js";
-import type { Config } from "./config.js";
+import { REPO_URL, type Config } from "./config.js";
+import { homePage } from "./home.js";
 import { publicResult, rejectedResult } from "./policy.js";
 import type { ApiKeyRow, NewUrl, Store } from "./store.js";
 import type { RecentCheck, TickReport } from "./scheduler.js";
@@ -30,7 +31,13 @@ export async function handleRequest(req: Request, deps: ApiDeps): Promise<Respon
   const path = url.pathname.replace(/\/+$/, "") || "/";
 
   if (path === "/" && req.method === "GET") {
-    return json({ service: "link-check-proxy", docs: "see PROJECT.md" });
+    // Browsers get the human page; API clients (curl, scripts) get JSON.
+    if ((req.headers.get("accept") ?? "").includes("text/html")) {
+      return new Response(homePage(url.origin, deps.cfg), {
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=300" },
+      });
+    }
+    return json({ service: "link-check-proxy", docs: REPO_URL });
   }
 
   const caller = await authenticate(req, deps);

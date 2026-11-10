@@ -83,6 +83,16 @@ limits by orders of magnitude without design changes.
 
 All endpoints are versioned under `/v1`. Auth: `Authorization: Bearer <key>`.
 
+### `GET /` (public)
+
+This is the only endpoint that needs no key. When `Accept` includes
+`text/html` (a browser), it returns the consumer page (`src/home.ts`). That
+page explains what the service is, how to request a key through the GitHub
+issue form, how to read the results, and gives a GitHub Actions example.
+Otherwise it returns `{"service": "link-check-proxy", "docs": <repo URL>}`.
+The outbound User-Agent links to the repository, so site operators can find
+out who is checking their URLs.
+
 ### `POST /v1/check`
 
 Request:

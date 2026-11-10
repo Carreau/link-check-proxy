@@ -1,0 +1,55 @@
+name: API key request
+description: Ask for a link-check-proxy API key for your project's CI.
+title: "API key request: <project>"
+labels: ["api-key"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keys are issued by hand to projects in the Jupyter / Scientific Python ecosystem.
+        The key will be sent to you **privately**. Never paste a key into an issue, commit or CI log.
+  - type: input
+    id: project
+    attributes:
+      label: Project
+      placeholder: e.g. NumPy
+    validations:
+      required: true
+  - type: input
+    id: repos
+    attributes:
+      label: Repository / repositories that will use the key
+      placeholder: https://github.com/numpy/numpy
+    validations:
+      required: true
+  - type: input
+    id: contact
+    attributes:
+      label: Maintainer contact
+      description: GitHub handle of the maintainer who will hold the key and add it as a CI secret.
+      placeholder: "@your-handle"
+    validations:
+      required: true
+  - type: input
+    id: urls
+    attributes:
+      label: Roughly how many distinct links do you check?
+      placeholder: e.g. 1500
+    validations:
+      required: true
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: How often does your link check run?
+      options:
+        - On every push / PR
+        - Daily or nightly
+        - Weekly or less
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else?
+      description: Link checker used (Sphinx linkcheck, lychee, …), special needs, questions.

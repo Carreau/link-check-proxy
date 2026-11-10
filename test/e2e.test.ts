@@ -231,3 +231,21 @@ describe("admin overview", () => {
     expect((await call("GET", "/v1/admin/overview", key2)).status).toBe(403);
   });
 });
+
+describe("root page", () => {
+  it("serves HTML to browsers and JSON to API clients, without a key", async () => {
+    const html = await handleRequest(
+      new Request("https://proxy.test/", { headers: { accept: "text/html,application/xhtml+xml" } }),
+      { store, cfg, nowMs: () => clock, adminToken: ADMIN },
+    );
+    expect(html.status).toBe(200);
+    expect(html.headers.get("content-type")).toContain("text/html");
+    const body = await html.text();
+    expect(body).toContain("https://proxy.test/v1/check");
+    expect(body).toContain("issues/new?template=api-key.yml");
+
+    const api = await call("GET", "/");
+    expect(api.headers.get("content-type")).toContain("application/json");
+    expect(await api.json()).toMatchObject({ service: "link-check-proxy" });
+  });
+});

@@ -5,11 +5,16 @@ Python ecosystem. Instead of every CI run hitting every external URL, clients
 ask this service, which answers right away from its cache and checks the URLs
 itself in the background, slowly and politely.
 
-For the design, see [PROJECT.md](PROJECT.md).
+For the design, see [PROJECT.md](PROJECT.md). Using the service from your
+project's CI? Open https://link-check-proxy.carreau.workers.dev in a browser
+for consumer instructions, or
+[request an API key](https://github.com/carreau/link-check-proxy/issues/new?template=api-key.yml).
 
 ## API
 
-All endpoints require `Authorization: Bearer <key>`.
+All `/v1/*` endpoints require `Authorization: Bearer <key>`. The root `/` is
+public. Browsers get a page for consumers (from `src/home.ts`); API clients
+get a small JSON blob.
 
 ```console
 $ curl -s $LCP_URL/v1/check \
@@ -122,12 +127,16 @@ wrangler d1 execute link-check-proxy --remote \
 
 ## Issuing API keys
 
-Keys are created by hand and given to projects directly:
+Projects ask for a key by opening an issue with the "API key request" form
+(`.github/ISSUE_TEMPLATE/api-key.yml`), which the root page links to. Create
+the key as below, **send it to the requester privately** (never in the
+issue), then close the issue. Use the project name as the key's `name` and
+the issue URL as its `owner`, so every key can be traced back to its request:
 
 ```console
 $ curl -s $LCP_URL/v1/admin/keys \
     -H "Authorization: Bearer $ADMIN_TOKEN" \
-    -d '{"name": "numpy", "owner": "numpy maintainers", "quota": 5000}'
+    -d '{"name": "numpy", "owner": "https://github.com/carreau/link-check-proxy/issues/12", "quota": 5000}'
 {"id": "key_…", "key": "lcp_…", ...}     # the key is shown only once
 
 $ curl -s $LCP_URL/v1/admin/keys -H "Authorization: Bearer $ADMIN_TOKEN"
