@@ -506,7 +506,7 @@ watcher's "overdue" times for such a host reflect it.
   No self-serve signup. Default quota is 500 new URLs/day.
 - **GitHub OIDC:** an allowlist of orgs and repos in `config/github-oidc.json`,
   managed through PRs and deployed with the code. The initial entries are the
-  jupyter and ipython orgs, plus pydata/pydata-sphinx-theme and
+  jupyter, ipython and napari orgs, plus pydata/pydata-sphinx-theme and
   Quansight-Labs/intersphinx_registry. `pull_request` runs are read-only.
 - **No anonymous access:** every request without a valid key is refused
   with `401`. Unauthenticated callers can never cause an outbound check. The

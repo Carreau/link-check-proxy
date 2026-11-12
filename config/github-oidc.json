@@ -12,6 +12,11 @@
       "owner_id": 230453
     },
     {
+      "name": "napari",
+      "owner": "napari",
+      "owner_id": 39813916
+    },
+    {
       "name": "pydata-sphinx-theme",
       "repository": "pydata/pydata-sphinx-theme",
       "repository_id": 130237506
