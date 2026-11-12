@@ -127,6 +127,16 @@ Otherwise it returns `{"service": "link-check-proxy", "docs": <repo URL>}`.
 The outbound User-Agent links to the repository, so site operators can find
 out who is checking their URLs.
 
+### `GET /status` (public)
+
+A human-readable view of the snapshot (`src/status.ts`), served as a static
+HTML shell. The browser downloads `/v1/snapshot.json` and renders it, so the
+Worker does no D1 reads or extra CPU for it. It shows each URL's last result,
+"last checked" and "fresh until" as relative times (exact local time on hover),
+with filtering by URL, result class and staleness, sorting, and paging of 200
+rows at a time. It shows `expires_at`, not the scheduler's `next_check_at`,
+which the snapshot does not carry. It says that all listed URLs are public.
+
 ### `GET /v1/snapshot.json` (public)
 
 The second endpoint that needs no key. It returns every **checked** URL with
@@ -484,8 +494,8 @@ watcher's "overdue" times for such a host reflect it.
 - Per-host and per-URL policy tuning, learned from observed flakiness.
 - Optional `wait_ms` on `/v1/check`, to check a small number of unknown URLs
   synchronously.
-- A human-readable status page built from the snapshot: most-linked dead
-  URLs, per-host health.
+- Richer status page (`/status` exists): most-linked dead URLs, per-host
+  health, and the scheduler's `next_check_at` (needs a snapshot format bump).
 
 ## 11. Decisions
 

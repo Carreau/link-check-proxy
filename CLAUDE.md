@@ -21,6 +21,8 @@ background.
 - `src/home.ts` is the public consumer page served at `/`. Keep it in sync
   with the API, the result states and the TTLs. Keys are requested through
   `.github/ISSUE_TEMPLATE/api-key.yml` and are never posted in issues.
+- `src/status.ts` is the public `/status` page. It renders the snapshot in the
+  browser, so keep it in sync with the snapshot fields.
 - **All submitted URLs are public** (published in `/v1/snapshot.json`). Any
   user-facing text about submitting URLs must say so. Never add features
   that assume URLs are private.

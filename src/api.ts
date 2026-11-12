@@ -2,6 +2,7 @@
 import { bearerToken, generateApiKey, randomToken, sha256Hex, timingSafeEqualHex } from "./auth.js";
 import { DEFAULT_KEY_QUOTA, REPO_URL, type Config } from "./config.js";
 import { homePage } from "./home.js";
+import { statusPage } from "./status.js";
 import { publicResult, rejectedResult } from "./policy.js";
 import type { ApiKeyRow, NewUrl, Store } from "./store.js";
 import type { RecentCheck, TickReport } from "./scheduler.js";
@@ -47,6 +48,12 @@ export async function handleRequest(req: Request, deps: ApiDeps): Promise<Respon
       });
     }
     return json({ service: "link-check-proxy", docs: REPO_URL });
+  }
+
+  if (path === "/status" && req.method === "GET") {
+    return new Response(statusPage(url.origin), {
+      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=300" },
+    });
   }
 
   // Public, read-only, never adds URLs: everything in it is already public.

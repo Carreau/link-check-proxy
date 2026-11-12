@@ -69,7 +69,7 @@ export function homePage(origin: string, cfg: Config): string {
 <main>
 <h1>link-check-proxy</h1>
 <p class="lede">A shared, polite link-status cache for CI link checkers in the Jupyter and Scientific Python ecosystem.</p>
-<nav class="links"><a href="${o}/v1/snapshot.json">Public snapshot (JSON)</a> · <a href="#access">Get access</a> · <a href="${repo}">Source</a></nav>
+<nav class="links"><a href="${o}/status">Status</a> · <a href="${o}/v1/snapshot.json">Public snapshot (JSON)</a> · <a href="#access">Get access</a> · <a href="${repo}">Source</a></nav>
 
 <h2>Why</h2>
 <p>Many projects run a link checker (Sphinx <code>linkcheck</code>, lychee, markdown-link-check, …) on every push and pull request. Each run hits every external URL again, and the same few sites get the same requests from dozens of projects. Those sites start rate-limiting or blocking CI, and builds turn red for reasons that have nothing to do with your change.</p>

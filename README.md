@@ -25,7 +25,9 @@ All `/v1/*` endpoints require `Authorization: Bearer <credential>`, except
 `/v1/snapshot.json`. The credential is an API key, or a GitHub Actions OIDC
 token from an allowlisted org or repository (see [GitHub OIDC](#github-oidc)).
 The root `/` is public. Browsers get a page for consumers (from
-`src/home.ts`); API clients get a small JSON blob.
+`src/home.ts`); API clients get a small JSON blob. `/status` is a public
+page that renders the snapshot for humans (last checked, fresh until,
+filters); it costs the Worker nothing beyond serving static HTML.
 
 ```console
 $ curl -s $LCP_URL/v1/check \

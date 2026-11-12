@@ -481,3 +481,14 @@ describe("runScheduled", () => {
     expect(r2.kind === "maintenance" && r2.report.dropped).toBe(1);
   });
 });
+
+describe("status page", () => {
+  it("serves the static HTML shell without a key", async () => {
+    const res = await call("GET", "/status");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    const body = await res.text();
+    expect(body).toContain("https://proxy.test/v1/snapshot.json");
+    expect(body).toContain("are public");
+  });
+});
